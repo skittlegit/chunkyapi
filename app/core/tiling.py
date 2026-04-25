@@ -1,12 +1,13 @@
-"""AOI tiling and polygon utilities."""
+"""AOI tiling utilities."""
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import List, Tuple
 
+import numpy as np
 
-LatLon = Tuple[float, float]  # (lat_deg, lon_deg)
+from .imaging import polygon_area_latlon_km2, sutherland_hodgman_clip, _equirect_xy
 
 
 @dataclass
@@ -14,106 +15,135 @@ class TileCenter:
     id: str
     lat_deg: float
     lon_deg: float
-    row: int
-    col: int
+    size_deg: float
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "lat_deg": self.lat_deg,
+            "lon_deg": self.lon_deg,
+            "size_deg": self.size_deg,
+        }
 
 
-def polygon_bbox(poly: Sequence[LatLon]) -> Tuple[float, float, float, float]:
-    lats = [p[0] for p in poly]
-    lons = [p[1] for p in poly]
-    return min(lats), min(lons), max(lats), max(lons)
-
-
-def point_in_polygon(point: LatLon, poly: Sequence[LatLon]) -> bool:
-    """Standard ray-casting in (lat, lon) plane. Adequate for small AOIs."""
-    lat, lon = point
+def point_in_polygon(lat: float, lon: float, poly: List[Tuple[float, float]]) -> bool:
+    """Ray-casting; poly is list of (lat, lon)."""
     inside = False
     n = len(poly)
     j = n - 1
     for i in range(n):
-        lat_i, lon_i = poly[i]
-        lat_j, lon_j = poly[j]
-        if (lon_i > lon) != (lon_j > lon):
-            x_intersect = (lat_j - lat_i) * (lon - lon_i) / ((lon_j - lon_i) or 1e-12) + lat_i
-            if lat < x_intersect:
-                inside = not inside
+        yi, xi = poly[i]
+        yj, xj = poly[j]
+        if ((yi > lat) != (yj > lat)) and (
+            lon < (xj - xi) * (lat - yi) / (yj - yi + 1e-15) + xi
+        ):
+            inside = not inside
         j = i
     return inside
 
 
-def adaptive_tile_size_km(off_nadir_deg: float, fov_deg: float, altitude_km: float) -> float:
-    """Approx tile spacing (km) based on expected ground footprint, with overlap."""
+def adaptive_tile_size_km(off_nadir_deg: float, fov_deg: float, alt_km: float) -> float:
+    """Approximate footprint size (along-look diagonal) at given off-nadir."""
     half = math.radians(fov_deg / 2.0)
-    theta = math.radians(off_nadir_deg)
-    # Along-look stretch
-    along = altitude_km * (math.tan(theta + half) - math.tan(theta - half))
-    # Cross-look ~ 2*h*tan(half) / cos(theta)
-    cross = 2.0 * altitude_km * math.tan(half) / max(math.cos(theta), 0.05)
-    tile_km = min(along, cross) * 0.85  # 15% overlap
-    return max(5.0, tile_km)
+    th = math.radians(off_nadir_deg)
+    near = alt_km * math.tan(max(0.0, th - half))
+    far = alt_km * math.tan(min(math.pi / 2 - 1e-3, th + half))
+    along = max(2.0 * alt_km * math.tan(half), far - near)
+    cross = 2.0 * alt_km * math.tan(half) / max(math.cos(th), 0.2)
+    # Use the smaller dimension to get full coverage with overlap
+    return min(along, cross) * 0.9   # 10% overlap factor
 
 
-def km_to_deg(lat_deg: float) -> Tuple[float, float]:
-    KM_PER_DEG_LAT = 110.574
-    KM_PER_DEG_LON = 111.320 * max(math.cos(math.radians(lat_deg)), 1e-3)
-    return KM_PER_DEG_LAT, KM_PER_DEG_LON
+def km_to_deg_lat(km: float) -> float:
+    return km / 111.0
+
+
+def km_to_deg_lon(km: float, lat_deg: float) -> float:
+    return km / (111.0 * max(math.cos(math.radians(lat_deg)), 0.2))
 
 
 def tile_aoi(
-    aoi_polygon: Sequence[LatLon], tile_size_km: float
+    aoi_polygon: List[Tuple[float, float]],
+    tile_size_km: float,
 ) -> List[TileCenter]:
-    lat_min, lon_min, lat_max, lon_max = polygon_bbox(aoi_polygon)
+    """Build a regular lat/lon grid covering the AOI bbox; keep tiles whose
+    center is inside the polygon.
+    """
+    lats = [p[0] for p in aoi_polygon]
+    lons = [p[1] for p in aoi_polygon]
+    lat_min, lat_max = min(lats), max(lats)
+    lon_min, lon_max = min(lons), max(lons)
     lat_c = 0.5 * (lat_min + lat_max)
-    km_lat, km_lon = km_to_deg(lat_c)
-    d_lat = tile_size_km / km_lat
-    d_lon = tile_size_km / km_lon
+
+    d_lat = km_to_deg_lat(tile_size_km)
+    d_lon = km_to_deg_lon(tile_size_km, lat_c)
 
     n_lat = max(1, int(math.ceil((lat_max - lat_min) / d_lat)))
     n_lon = max(1, int(math.ceil((lon_max - lon_min) / d_lon)))
 
+    # Center the grid in the bbox
+    used_lat = n_lat * d_lat
+    used_lon = n_lon * d_lon
+    lat0 = lat_min + (lat_max - lat_min - used_lat) / 2.0 + d_lat / 2.0
+    lon0 = lon_min + (lon_max - lon_min - used_lon) / 2.0 + d_lon / 2.0
+
     tiles: List[TileCenter] = []
     for i in range(n_lat):
-        lat = lat_min + (i + 0.5) * d_lat
         for j in range(n_lon):
-            lon = lon_min + (j + 0.5) * d_lon
-            if point_in_polygon((lat, lon), aoi_polygon):
+            lat = lat0 + i * d_lat
+            lon = lon0 + j * d_lon
+            if point_in_polygon(lat, lon, aoi_polygon):
                 tiles.append(
                     TileCenter(
-                        id=f"t_{i}_{j}",
+                        id=f"t_{i:02d}_{j:02d}",
                         lat_deg=lat,
                         lon_deg=lon,
-                        row=i,
-                        col=j,
+                        size_deg=max(d_lat, d_lon),
                     )
                 )
     return tiles
 
 
-def boustrophedon_order(tiles: List[TileCenter]) -> List[TileCenter]:
-    """Sort tiles row-major with alternating row directions."""
-    by_row: dict[int, list[TileCenter]] = {}
-    for t in tiles:
-        by_row.setdefault(t.row, []).append(t)
-    out: List[TileCenter] = []
-    for idx, row in enumerate(sorted(by_row.keys())):
-        row_tiles = sorted(by_row[row], key=lambda t: t.col)
-        if idx % 2 == 1:
-            row_tiles.reverse()
-        out.extend(row_tiles)
-    return out
+def tile_polygon(tile: TileCenter) -> List[Tuple[float, float]]:
+    """Return tile rectangle as 4 (lat, lon) corners in CCW order."""
+    half = tile.size_deg / 2.0
+    return [
+        (tile.lat_deg - half, tile.lon_deg - half),
+        (tile.lat_deg - half, tile.lon_deg + half),
+        (tile.lat_deg + half, tile.lon_deg + half),
+        (tile.lat_deg + half, tile.lon_deg - half),
+    ]
 
 
-def polygon_area_km2(poly: Sequence[LatLon]) -> float:
+def check_tile_coverage(
+    tile_poly: List[Tuple[float, float]],
+    footprint_poly: List[Tuple[float, float]],
+) -> float:
+    """Fraction of `tile_poly` covered by `footprint_poly`."""
+    if len(tile_poly) < 3 or len(footprint_poly) < 3:
+        return 0.0
+    lat0 = sum(p[0] for p in tile_poly) / len(tile_poly)
+    tile_xy = [tuple(row) for row in _equirect_xy(tile_poly, lat0)]
+    foot_xy = [tuple(row) for row in _equirect_xy(footprint_poly, lat0)]
+    # Ensure clip polygon is CCW for Sutherland-Hodgman
+    if _signed_area(foot_xy) < 0:
+        foot_xy = list(reversed(foot_xy))
+    if _signed_area(tile_xy) < 0:
+        tile_xy = list(reversed(tile_xy))
+    clipped = sutherland_hodgman_clip(tile_xy, foot_xy)
+    if not clipped:
+        return 0.0
+    a_clipped = abs(_signed_area(clipped))
+    a_tile = abs(_signed_area(tile_xy))
+    if a_tile <= 0:
+        return 0.0
+    return min(1.0, a_clipped / a_tile)
+
+
+def _signed_area(poly) -> float:
     if len(poly) < 3:
         return 0.0
-    lat0 = sum(p[0] for p in poly) / len(poly)
-    KM_PER_DEG_LAT = 110.574
-    KM_PER_DEG_LON = 111.320 * math.cos(math.radians(lat0))
-    xy = [((lon - poly[0][1]) * KM_PER_DEG_LON, (lat - poly[0][0]) * KM_PER_DEG_LAT) for (lat, lon) in poly]
-    s = 0.0
-    n = len(xy)
-    for i in range(n):
-        x1, y1 = xy[i]
-        x2, y2 = xy[(i + 1) % n]
-        s += x1 * y2 - x2 * y1
-    return abs(s) * 0.5
+    arr = np.asarray(poly, dtype=float)
+    x = arr[:, 0]
+    y = arr[:, 1]
+    return 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))

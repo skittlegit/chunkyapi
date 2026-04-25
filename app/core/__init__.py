@@ -1,1 +1,1 @@
-"""Empty package marker."""
+"""Core physics package."""

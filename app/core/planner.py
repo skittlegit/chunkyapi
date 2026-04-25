@@ -1,319 +1,324 @@
-"""Imaging mission planner.
-
-Boustrophedon raster scan with momentum-aware sequencing.
-"""
+"""Mission planner: build a schedule (attitude trajectory + shutter list)."""
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import List, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ..config import settings
+from ..config import (
+    DEFAULT_FOV_DEG,
+    DEFAULT_INERTIA,
+    OFF_NADIR_SAFE_LIMIT_DEG,
+    PASS_DURATION_S,
+    SHUTTER_DURATION_S,
+)
 from .attitude import (
     compute_off_nadir,
     compute_pointing_quat,
+    estimate_body_rate,
     generate_attitude_trajectory,
-    nadir_pointing_quat,
+    nadir_quat,
     quaternion_angular_distance,
 )
-from .dynamics import (
-    body_to_wheel_momentum,
-    check_saturation,
-    estimate_slew_time,
-)
+from .dynamics import estimate_slew_time, momentum_change_estimate
 from .frames import geodetic_to_eci
-from .imaging import compute_footprint, project_boresight
-from .propagator import EphemerisPoint, propagate_pass
+from .imaging import compute_footprint
+from .propagator import EphemerisPoint, ephemeris_arrays, propagate_pass
 from .tiling import (
     TileCenter,
     adaptive_tile_size_km,
-    boustrophedon_order,
-    polygon_area_km2,
+    point_in_polygon,
     tile_aoi,
 )
 
 
-LatLon = Tuple[float, float]
-
-
 @dataclass
-class TileAccess:
+class _TileWindow:
     tile: TileCenter
-    best_t: float
-    best_off_nadir: float
-    best_idx: int  # index into ephemeris
+    t_best: float            # time of minimum off-nadir (sec offset)
+    off_nadir_min: float     # at t_best (deg)
+    accessible: bool
 
 
-@dataclass
-class PlannedImage:
-    tile_id: str
-    t_image: float
-    q_BN: np.ndarray
-    off_nadir_deg: float
-    footprint: List[LatLon] = field(default_factory=list)
+def _index_at_time(t_array: np.ndarray, t: float) -> int:
+    return int(np.clip(np.argmin(np.abs(t_array - t)), 0, len(t_array) - 1))
 
 
-@dataclass
-class PlanResult:
-    schedule: dict
-    diagnostics: dict
-    ephemeris_summary: dict
+def _aoi_centroid(aoi: List[Tuple[float, float]]) -> Tuple[float, float]:
+    n = len(aoi)
+    return sum(p[0] for p in aoi) / n, sum(p[1] for p in aoi) / n
 
 
-def _tile_eci(lat_deg: float, lon_deg: float, jd: float) -> np.ndarray:
-    return geodetic_to_eci(math.radians(lat_deg), math.radians(lon_deg), 0.0, jd)
-
-
-def find_closest_approach(
-    ephemeris: List[EphemerisPoint], aoi_center_latlon: LatLon
-) -> int:
-    lat_c, lon_c = aoi_center_latlon
+def _find_closest_approach(
+    ephem: List[EphemerisPoint], aoi: List[Tuple[float, float]]
+) -> Tuple[int, float]:
+    """Index and off-nadir(deg) at AOI-center closest approach."""
+    lat_c, lon_c = _aoi_centroid(aoi)
     best_i = 0
-    best_d = float("inf")
-    for i, ep in enumerate(ephemeris):
-        target = _tile_eci(lat_c, lon_c, ep.jd)
-        d = float(np.linalg.norm(target - ep.r_eci))
-        if d < best_d:
-            best_d = d
+    best_off = 1e9
+    for i, p in enumerate(ephem):
+        if math.isnan(p.lat_deg):
+            continue
+        target = geodetic_to_eci(math.radians(lat_c), math.radians(lon_c), 0.0, p.jd)
+        off = compute_off_nadir(np.array(p.r_eci), target)
+        if off < best_off:
+            best_off = off
             best_i = i
-    return best_i
+    return best_i, best_off
 
 
-def evaluate_tile_access(
-    tile: TileCenter,
-    ephemeris: List[EphemerisPoint],
-    off_nadir_max_deg: float,
-) -> TileAccess | None:
-    best_idx = -1
-    best_off_nadir = float("inf")
-    for i, ep in enumerate(ephemeris):
-        target = _tile_eci(tile.lat_deg, tile.lon_deg, ep.jd)
-        off = compute_off_nadir(ep.r_eci, target)
-        if off < best_off_nadir:
-            best_off_nadir = off
-            best_idx = i
-    if best_idx < 0 or best_off_nadir > off_nadir_max_deg:
-        return None
-    ep = ephemeris[best_idx]
-    return TileAccess(tile=tile, best_t=ep.t_offset_s, best_off_nadir=best_off_nadir, best_idx=best_idx)
+def _scan_tile_windows(
+    ephem: List[EphemerisPoint],
+    tiles: List[TileCenter],
+    off_nadir_limit_deg: float,
+) -> List[_TileWindow]:
+    out: List[_TileWindow] = []
+    for tile in tiles:
+        best_i = -1
+        best_off = 1e9
+        lat_r = math.radians(tile.lat_deg)
+        lon_r = math.radians(tile.lon_deg)
+        for i, p in enumerate(ephem):
+            if math.isnan(p.lat_deg):
+                continue
+            target = geodetic_to_eci(lat_r, lon_r, 0.0, p.jd)
+            off = compute_off_nadir(np.array(p.r_eci), target)
+            if off < best_off:
+                best_off = off
+                best_i = i
+        accessible = best_off <= off_nadir_limit_deg and best_i >= 0
+        out.append(
+            _TileWindow(
+                tile=tile,
+                t_best=ephem[best_i].t_offset_s if best_i >= 0 else 0.0,
+                off_nadir_min=best_off,
+                accessible=accessible,
+            )
+        )
+    return out
 
 
-def _ephemeris_at_t(ephemeris: List[EphemerisPoint], t: float) -> EphemerisPoint:
-    idx = max(0, min(len(ephemeris) - 1, int(round(t))))
-    # If dt of ephemeris is 1.0 s this is exact-ish
-    return ephemeris[idx]
+def _serpentine_order(tiles: Sequence[TileCenter]) -> List[TileCenter]:
+    """Sort tiles in a boustrophedon raster (rows = lat, cols = lon)."""
+    if not tiles:
+        return []
+    # Group by row
+    by_lat: Dict[float, List[TileCenter]] = {}
+    for t in tiles:
+        key = round(t.lat_deg, 4)
+        by_lat.setdefault(key, []).append(t)
+    rows = sorted(by_lat.keys())
+    out: List[TileCenter] = []
+    for k, lat in enumerate(rows):
+        row = sorted(by_lat[lat], key=lambda x: x.lon_deg)
+        if k % 2 == 1:
+            row = list(reversed(row))
+        out.extend(row)
+    return out
 
 
 def plan_imaging(
-    tle1: str,
-    tle2: str,
-    aoi_polygon: Sequence[LatLon],
+    tle_line1: str,
+    tle_line2: str,
+    aoi_polygon: List[Tuple[float, float]],
     pass_start_utc: str,
     pass_end_utc: str,
+    sc_params: Optional[Dict] = None,
+    *,
+    strategy: str = "boustrophedon",
     settle_margin_s: float = 3.0,
     off_nadir_margin_deg: float = 5.0,
-    strategy: str = "boustrophedon",
-) -> PlanResult:
-    fov = settings.fov_deg
-    off_nadir_limit = settings.off_nadir_limit_deg - off_nadir_margin_deg
-    integration = settings.integration_time_s
+) -> Dict:
+    """Compute a full schedule. Returns a dict ready to serve via the API."""
+    sc_params = sc_params or {}
+    fov_deg = float(sc_params.get("fov_deg", DEFAULT_FOV_DEG))
+    inertia = tuple(sc_params.get("inertia", DEFAULT_INERTIA))
+    off_nadir_limit = OFF_NADIR_SAFE_LIMIT_DEG - off_nadir_margin_deg
 
-    # 1) Propagate
-    ephemeris = propagate_pass(tle1, tle2, pass_start_utc, pass_end_utc, dt=1.0)
-    if not ephemeris:
-        raise ValueError("Empty ephemeris from propagator")
+    # 1. Propagate
+    ephem = propagate_pass(tle_line1, tle_line2, pass_start_utc, pass_end_utc, dt=1.0)
+    t_arr, jd_arr, r_arr, v_arr, lla_arr = ephemeris_arrays(ephem)
+    n_steps = len(ephem)
+    if n_steps < 2:
+        raise ValueError("Pass window too short")
 
-    pass_duration = ephemeris[-1].t_offset_s - ephemeris[0].t_offset_s
+    # 2. Closest approach
+    ca_idx, ca_off = _find_closest_approach(ephem, aoi_polygon)
+    ca_t = ephem[ca_idx].t_offset_s
+    alt_km = ephem[ca_idx].alt_km if not math.isnan(ephem[ca_idx].alt_km) else 500.0
 
-    # 2) Closest approach
-    lat_c = sum(p[0] for p in aoi_polygon) / len(aoi_polygon)
-    lon_c = sum(p[1] for p in aoi_polygon) / len(aoi_polygon)
-    ca_idx = find_closest_approach(ephemeris, (lat_c, lon_c))
-    ca_ep = ephemeris[ca_idx]
-    target_ca = _tile_eci(lat_c, lon_c, ca_ep.jd)
-    off_at_ca = compute_off_nadir(ca_ep.r_eci, target_ca)
-
-    # 3) Tile the AOI based on expected off-nadir at CA
-    tile_size_km = adaptive_tile_size_km(off_at_ca, fov, settings.altitude_km_nominal)
+    # 3. Tile the AOI
+    tile_size_km = max(8.0, adaptive_tile_size_km(max(ca_off, 1.0), fov_deg, alt_km))
     tiles = tile_aoi(aoi_polygon, tile_size_km)
 
-    # 4) Determine accessible tiles
-    accesses: List[TileAccess] = []
-    for tile in tiles:
-        a = evaluate_tile_access(tile, ephemeris, off_nadir_limit)
-        if a is not None:
-            accesses.append(a)
+    # 4. Tile windows
+    windows = _scan_tile_windows(ephem, tiles, off_nadir_limit)
+    accessible = [w for w in windows if w.accessible]
 
-    # 5) Order tiles boustrophedon
-    accessible_tiles = [a.tile for a in accesses]
+    # 5. Order tiles (boustrophedon by default)
+    ordered_windows = sorted(accessible, key=lambda w: (w.tile.lat_deg, w.tile.lon_deg))
     if strategy == "boustrophedon":
-        ordered_tiles = boustrophedon_order(accessible_tiles)
+        ordered_tiles = _serpentine_order([w.tile for w in accessible])
+        # Realign by tile id
+        tile_to_window = {w.tile.id: w for w in accessible}
+        ordered_windows = [tile_to_window[t.id] for t in ordered_tiles]
     elif strategy == "center_first":
-        ordered_tiles = sorted(
-            accessible_tiles,
-            key=lambda t: (t.lat_deg - lat_c) ** 2 + (t.lon_deg - lon_c) ** 2,
+        lat_c, lon_c = _aoi_centroid(aoi_polygon)
+        ordered_windows = sorted(
+            accessible,
+            key=lambda w: (w.tile.lat_deg - lat_c) ** 2 + (w.tile.lon_deg - lon_c) ** 2,
         )
-    else:
-        # greedy: by best access time
-        access_by_id = {a.tile.id: a for a in accesses}
-        ordered_tiles = [access_by_id[t.id].tile for t in sorted(
-            accessible_tiles,
-            key=lambda t: access_by_id[t.id].best_t,
-        )]
-    access_by_id = {a.tile.id: a for a in accesses}
+    elif strategy == "greedy":
+        ordered_windows = sorted(accessible, key=lambda w: w.t_best)
 
-    # 6) Sequence: assign times, drop tiles that don't fit budget
-    planned: List[PlannedImage] = []
-    current_t = 5.0  # initial settle margin from start of pass
-    current_q = nadir_pointing_quat(ephemeris[0].r_eci, ephemeris[0].v_eci)
-    cumulative_dh = 0.0  # sum of |delta h_body| in N*m*s
-    Ix = settings.inertia_diag[0]
+    # 6. Build the time line: assign each tile an imaging time
+    schedule_entries: List[Dict] = []
+    delta_h_total = 0.0
+    t_cursor = max(2.0, ca_t - PASS_DURATION_S * 0.45)  # start ~3min before CA
+    t_cursor = min(t_cursor, PASS_DURATION_S - 10.0)
+    prev_q: Optional[np.ndarray] = None
 
-    for tile in ordered_tiles:
-        access = access_by_id[tile.id]
-        # Schedule at max(current_t, access.best_t - small margin), clamped
-        desired_t = max(current_t, access.best_t)
-        if desired_t + integration > pass_duration - 5.0:
-            # No more time
-            break
-        # Get ephemeris at the desired image time
-        ep = _ephemeris_at_t(ephemeris, desired_t)
-        target = _tile_eci(tile.lat_deg, tile.lon_deg, ep.jd)
-        off_nadir = compute_off_nadir(ep.r_eci, target)
-        if off_nadir > off_nadir_limit:
-            continue
-        q_target = compute_pointing_quat(ep.r_eci, ep.v_eci, target)
+    # Initial nadir attitude at t=0
+    init_q = nadir_quat(np.array(ephem[0].r_eci), np.array(ephem[0].v_eci))
+    waypoints: List[Tuple[float, np.ndarray]] = [(0.0, init_q)]
+    hold_intervals: List[Tuple[float, float]] = []
+    shutters: List[Dict] = []
+    skipped: List[str] = []
+    body_rate_estimates: List[float] = []
 
-        # Slew time estimate
-        slew_angle_rad = quaternion_angular_distance(current_q, q_target)
-        slew_angle_deg = math.degrees(slew_angle_rad)
-        t_slew = estimate_slew_time(slew_angle_deg)
-        t_settle = settle_margin_s
-
-        t_start_slew = current_t
-        t_end_slew = t_start_slew + t_slew
-        t_image_start = t_end_slew + t_settle
-        t_image_end = t_image_start + integration
-
-        if t_image_end > pass_duration - 2.0:
-            break
-
-        # Momentum bookkeeping (rough): peak body momentum during slew
-        delta_h_body = Ix * slew_angle_rad / max(t_slew, 0.5)  # I*omega_peak
-        # Apply both for accel and decel
-        cumulative_dh += 2.0 * abs(delta_h_body)
-
-        # Saturation check (very approximate): treat the slew as cross-track
-        h_body = np.array([delta_h_body, 0.0, 0.0])
-        h_wheels = body_to_wheel_momentum(h_body)
-        sat, frac = check_saturation(h_wheels)
-        if sat:
-            continue
-
-        # Footprint
-        footprint = compute_footprint(ep.r_eci, q_target, fov, ep.jd)
-
-        planned.append(
-            PlannedImage(
-                tile_id=tile.id,
-                t_image=t_image_start,
-                q_BN=q_target,
-                off_nadir_deg=off_nadir,
-                footprint=footprint,
-            )
-        )
-        current_q = q_target
-        current_t = t_image_end
-
-    # 7) Build attitude trajectory waypoints
-    waypoints: List[Tuple[float, np.ndarray]] = []
-    # Start: nadir at t=0
-    q_start = nadir_pointing_quat(ephemeris[0].r_eci, ephemeris[0].v_eci)
-    waypoints.append((0.0, q_start))
-
+    prev_q = init_q
     prev_t = 0.0
-    for img in planned:
-        # Slew from prev to image attitude across the (t_prev_end, t_image_start) window
-        # Slew completes at t_image_start - settle (but the controller settles in real life;
-        # for the schedule we just need the attitude at the shutter to be q_BN).
-        slew_arrive = max(prev_t + 0.5, img.t_image - 0.1)
-        if slew_arrive > prev_t:
-            waypoints.append((slew_arrive, img.q_BN))
-        # Hold during shutter
-        waypoints.append((img.t_image + settings.integration_time_s, img.q_BN))
-        prev_t = img.t_image + settings.integration_time_s
 
-    # End: return toward nadir at end of pass
-    last_ep = ephemeris[-1]
-    q_end = nadir_pointing_quat(last_ep.r_eci, last_ep.v_eci)
-    if waypoints[-1][0] < pass_duration:
-        waypoints.append((pass_duration, q_end))
+    for w in ordered_windows:
+        # Sample the satellite state at the best observation time
+        i_obs = _index_at_time(t_arr, w.t_best)
+        r_sat = r_arr[i_obs]
+        v_sat = v_arr[i_obs]
+        jd_obs = jd_arr[i_obs]
+        target = geodetic_to_eci(
+            math.radians(w.tile.lat_deg),
+            math.radians(w.tile.lon_deg),
+            0.0,
+            jd_obs,
+        )
+        q_obs = compute_pointing_quat(r_sat, v_sat, target)
+        ang = quaternion_angular_distance(prev_q, q_obs)
+        slew = estimate_slew_time(ang, inertia)
+        # Time to start observing this tile
+        t_obs = max(t_cursor, prev_t) + slew + settle_margin_s
+        # Don't image after the time the geometry is good for (use later if needed)
+        t_obs = max(t_obs, w.t_best)  # don't image earlier than the access window center
+        # Check budget
+        dh = momentum_change_estimate(ang, inertia)
+        if delta_h_total + dh > 0.180:    # leave some margin from 0.200
+            skipped.append(w.tile.id)
+            continue
+        if t_obs + SHUTTER_DURATION_S > PASS_DURATION_S - 1.0:
+            skipped.append(w.tile.id)
+            continue
 
-    attitude_samples = generate_attitude_trajectory(waypoints, dt=0.020)
+        # Insert slew start waypoint and hold start waypoint
+        # - end of slew = t_obs - 0   (settle is implicit; the trajectory will
+        #   smoothly arrive at q_obs at t_obs)
+        t_slew_start = max(prev_t, t_obs - slew - settle_margin_s)
+        t_settle_start = t_obs - settle_margin_s
+        if t_settle_start < t_slew_start + 1e-3:
+            t_settle_start = t_slew_start + max(slew, 0.05)
+        if t_obs < t_settle_start + 1e-3:
+            t_obs = t_settle_start + 0.1
 
-    # 8) Schedule dict
-    attitude_list = [
-        {
-            "t": float(t),
-            "q_BN": [float(q[0]), float(q[1]), float(q[2]), float(q[3])],
-        }
-        for t, q in attitude_samples
-    ]
-    shutter_list = [
-        {
-            "t_start": float(img.t_image),
-            "t_end": float(img.t_image + integration),
-            "duration_s": float(integration),
-            "tile_id": img.tile_id,
-        }
-        for img in planned
-    ]
+        # During [t_slew_start, t_settle_start] we do the slew
+        # During [t_settle_start, t_obs + SHUTTER]: hold q_obs
+        waypoints.append((t_slew_start, prev_q))
+        waypoints.append((t_settle_start, q_obs))
+        waypoints.append((t_obs, q_obs))
+        waypoints.append((t_obs + SHUTTER_DURATION_S, q_obs))
+        hold_intervals.append((t_settle_start, t_obs + SHUTTER_DURATION_S))
 
-    schedule = {
-        "pass_start_utc": pass_start_utc,
-        "pass_end_utc": pass_end_utc,
-        "attitude": attitude_list,
-        "shutters": shutter_list,
-        "metadata": {
-            "n_images": len(planned),
-            "fov_deg": fov,
-            "tile_size_km": tile_size_km,
-        },
-    }
+        shutters.append(
+            {
+                "t_start": float(t_obs),
+                "t_end": float(t_obs + SHUTTER_DURATION_S),
+                "tile_id": w.tile.id,
+                "tile_lat_deg": float(w.tile.lat_deg),
+                "tile_lon_deg": float(w.tile.lon_deg),
+                "off_nadir_deg": float(w.off_nadir_min),
+                "q_BN": [float(x) for x in q_obs],
+            }
+        )
+
+        delta_h_total += dh
+        body_rate_estimates.append(0.0)  # held attitude during shutter
+        prev_q = q_obs
+        prev_t = t_obs + SHUTTER_DURATION_S
+        t_cursor = prev_t
+
+    # Final return-to-nadir at end of pass
+    t_end_eph = ephem[-1].t_offset_s
+    if prev_t < t_end_eph - 0.5:
+        final_q = nadir_quat(np.array(ephem[-1].r_eci), np.array(ephem[-1].v_eci))
+        ang = quaternion_angular_distance(prev_q, final_q)
+        slew = estimate_slew_time(ang, inertia)
+        t_slew_start = min(prev_t + 0.5, t_end_eph - max(slew, 0.5))
+        waypoints.append((t_slew_start, prev_q))
+        waypoints.append((t_end_eph, final_q))
+
+    # Generate trajectory
+    trajectory = generate_attitude_trajectory(
+        waypoints, dt=0.020, hold_dt=0.100, hold_intervals=hold_intervals
+    )
+
+    # Compute footprints
+    footprints: List[List[Tuple[float, float]]] = []
+    for s in shutters:
+        i = _index_at_time(t_arr, s["t_start"])
+        fp = compute_footprint(r_arr[i], np.array(s["q_BN"]), jd_arr[i], fov_deg)
+        s["footprint"] = [list(c) for c in fp]
+        footprints.append(fp)
 
     # Diagnostics
-    aoi_area = polygon_area_km2(list(aoi_polygon))
-    estimated_coverage = min(1.0, len(planned) * (tile_size_km ** 2) / max(aoi_area, 1e-6))
+    t_active = sum(s["t_end"] - s["t_start"] for s in shutters)
+    if shutters:
+        t_active += shutters[-1]["t_end"] - shutters[0]["t_start"]
+
+    schedule = {
+        "meta": {
+            "pass_start_utc": pass_start_utc,
+            "pass_end_utc": pass_end_utc,
+            "fov_deg": fov_deg,
+            "inertia": list(inertia),
+        },
+        "attitude": [
+            {"t": float(t), "q_BN": [float(x) for x in q]} for t, q in trajectory
+        ],
+        "shutters": shutters,
+    }
     diagnostics = {
         "n_tiles_total": len(tiles),
-        "n_tiles_accessible": len(accesses),
-        "n_tiles_imaged": len(planned),
-        "estimated_coverage": estimated_coverage,
+        "n_tiles_imaged": len(shutters),
+        "n_tiles_skipped": len(skipped),
+        "skipped_tile_ids": skipped,
+        "estimated_delta_h_used_nms": float(delta_h_total),
         "imaging_window_s": [
-            float(planned[0].t_image) if planned else 0.0,
-            float(planned[-1].t_image + integration) if planned else 0.0,
+            float(shutters[0]["t_start"]) if shutters else None,
+            float(shutters[-1]["t_end"]) if shutters else None,
         ],
-        "closest_approach_s": float(ca_ep.t_offset_s),
-        "off_nadir_at_ca_deg": float(off_at_ca),
-        "tile_size_km": tile_size_km,
-        "cumulative_delta_h_nms": cumulative_dh,
-        "footprints": [
-            {"tile_id": img.tile_id, "corners_latlon": img.footprint, "off_nadir_deg": img.off_nadir_deg}
-            for img in planned
-        ],
+        "closest_approach_s": float(ca_t),
+        "closest_approach_off_nadir_deg": float(ca_off),
+        "tile_size_km": float(tile_size_km),
     }
-    ephemeris_summary = {
-        "closest_approach_t": float(ca_ep.t_offset_s),
-        "min_off_nadir_deg": float(off_at_ca),
-        "sub_sat_lat_at_ca": float(ca_ep.lat_deg),
-        "sub_sat_lon_at_ca": float(ca_ep.lon_deg),
-        "altitude_km_at_ca": float(ca_ep.alt_km),
+    return {
+        "schedule": schedule,
+        "diagnostics": diagnostics,
+        "ephemeris_summary": {
+            "closest_approach_t": float(ca_t),
+            "min_off_nadir_deg": float(ca_off),
+            "sub_sat_lat_at_ca": float(ephem[ca_idx].lat_deg),
+            "sub_sat_lon_at_ca": float(ephem[ca_idx].lon_deg),
+            "n_ephem_points": len(ephem),
+        },
+        "tiles": [t.to_dict() for t in tiles],
+        "footprints": [[list(c) for c in fp] for fp in footprints],
     }
-
-    return PlanResult(
-        schedule=schedule,
-        diagnostics=diagnostics,
-        ephemeris_summary=ephemeris_summary,
-    )

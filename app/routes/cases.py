@@ -8,21 +8,21 @@ from fastapi import APIRouter, HTTPException
 from ..core.attitude import compute_off_nadir
 from ..core.frames import geodetic_to_eci
 from ..core.propagator import propagate_pass
-from ..data import get_case, load_cases
+from ..data import get_case, list_cases
 
 router = APIRouter(prefix="/api", tags=["cases"])
 
 
 @router.get("/cases")
-def list_cases() -> Dict[str, Any]:
-    return {"cases": load_cases()}
+def list_cases_route() -> Dict[str, Any]:
+    return {"cases": list_cases()}
 
 
 @router.get("/cases/{case_id}")
 def get_case_route(case_id: str) -> Dict[str, Any]:
     c = get_case(case_id)
     if c is None:
-        raise HTTPException(status_code=404, detail=f"Unknown case_id: {case_id}")
+        raise HTTPException(404, f"Unknown case_id: {case_id}")
     return c
 
 
@@ -30,7 +30,7 @@ def get_case_route(case_id: str) -> Dict[str, Any]:
 def get_case_ephemeris(case_id: str, dt_s: float = 1.0) -> Dict[str, Any]:
     c = get_case(case_id)
     if c is None:
-        raise HTTPException(status_code=404, detail=f"Unknown case_id: {case_id}")
+        raise HTTPException(404, f"Unknown case_id: {case_id}")
     eph = propagate_pass(
         c["tle_line1"],
         c["tle_line2"],
@@ -51,13 +51,9 @@ def get_case_ephemeris(case_id: str, dt_s: float = 1.0) -> Dict[str, Any]:
                 "lat_deg": ep.lat_deg,
                 "lon_deg": ep.lon_deg,
                 "alt_km": ep.alt_km,
-                "r_eci_km": [float(x) for x in ep.r_eci],
-                "v_eci_kms": [float(x) for x in ep.v_eci],
+                "r_eci_km": list(ep.r_eci),
+                "v_eci_kms": list(ep.v_eci),
                 "off_nadir_to_aoi_center_deg": off,
             }
         )
-    return {
-        "case_id": case_id,
-        "aoi_center": [lat_c, lon_c],
-        "samples": samples,
-    }
+    return {"case_id": case_id, "aoi_center": [lat_c, lon_c], "samples": samples}

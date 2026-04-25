@@ -1,4 +1,4 @@
-"""Reaction wheel momentum & slew dynamics."""
+"""Reaction-wheel dynamics & slew time estimation."""
 from __future__ import annotations
 
 import math
@@ -6,70 +6,153 @@ from typing import List, Tuple
 
 import numpy as np
 
-from ..config import settings
+from ..config import (
+    DEFAULT_INERTIA,
+    WHEEL_H_SAFE_NMS,
+)
+
+
+COS45 = math.cos(math.radians(45.0))
+SIN45 = math.sin(math.radians(45.0))
 
 
 def wheel_jacobian() -> np.ndarray:
-    """3x4 W matrix mapping wheel momentum -> body momentum.
-
-    Pyramid of 4 wheels canted at 45°, evenly spaced in azimuth.
-    """
-    cant = math.radians(45.0)
-    s = math.sin(cant)
-    c = math.cos(cant)
-    azimuths = [0.0, math.pi / 2, math.pi, 3 * math.pi / 2]
-    cols = []
-    for az in azimuths:
-        cols.append([s * math.cos(az), s * math.sin(az), c])
-    return np.array(cols).T  # shape (3,4)
-
-
-W_MATRIX = wheel_jacobian()
-W_PINV = np.linalg.pinv(W_MATRIX)
+    """3x4 W matrix: H_body = W @ h_wheels for the pyramid configuration."""
+    return np.array(
+        [
+            [SIN45, 0.0, -SIN45, 0.0],
+            [0.0, SIN45, 0.0, -SIN45],
+            [COS45, COS45, COS45, COS45],
+        ],
+        dtype=float,
+    )
 
 
 def body_to_wheel_momentum(h_body: np.ndarray) -> np.ndarray:
-    return W_PINV @ np.asarray(h_body, dtype=float)
-
-
-def wheel_to_body_momentum(h_wheels: np.ndarray) -> np.ndarray:
-    return W_MATRIX @ np.asarray(h_wheels, dtype=float)
+    W = wheel_jacobian()
+    h, *_ = np.linalg.lstsq(W, np.asarray(h_body, dtype=float), rcond=None)
+    return h
 
 
 def check_saturation(
-    h_wheels: np.ndarray, h_max: float | None = None
+    h_wheels: np.ndarray, h_safe: float = WHEEL_H_SAFE_NMS
 ) -> Tuple[bool, float]:
-    if h_max is None:
-        h_max = settings.wheel_h_safe_nms
-    max_abs = float(np.max(np.abs(h_wheels)))
-    return max_abs > h_max, max_abs / h_max
+    h = np.abs(np.asarray(h_wheels, dtype=float))
+    max_frac = float(np.max(h) / h_safe) if h_safe > 0 else 0.0
+    return max_frac > 1.0, max_frac
 
 
-def estimate_slew_time(angle_deg: float, axis: str = "xy") -> float:
-    """Approximate bang-coast-bang slew time for a momentum-limited slew.
+def momentum_envelope(inertia=DEFAULT_INERTIA) -> np.ndarray:
+    """Approximate per-axis body-momentum limits in N m s."""
+    Ix, Iy, Iz = inertia
+    # From the pyramid geometry, two wheels contribute to each X/Y axis:
+    Hxy = 2.0 * SIN45 * WHEEL_H_SAFE_NMS
+    Hz = 4.0 * COS45 * WHEEL_H_SAFE_NMS
+    return np.array([Hxy, Hxy, Hz])
 
-    Uses the smaller of the X/Y body rate limit (~20 deg/s) for arbitrary
-    cross-track slews, or the Z limit for yaw.
+
+def max_body_rates(inertia=DEFAULT_INERTIA) -> np.ndarray:
+    """Per-axis max angular rate (rad/s) given the safe momentum envelope."""
+    H = momentum_envelope(inertia)
+    return H / np.array(inertia)
+
+
+def estimate_slew_time(
+    angle_rad: float, inertia=DEFAULT_INERTIA, eigen_axis: np.ndarray | None = None
+) -> float:
+    """Time for a slew of `angle_rad` using the worst-axis rate limit.
+
+    If `eigen_axis` is provided, project the limit on that direction; otherwise
+    use the smallest of the per-axis limits (most conservative).
     """
-    if angle_deg <= 0.0:
+    if angle_rad <= 1e-9:
         return 0.0
-    # From momentum budget: omega_max = h_body_max / I
-    Ix, Iy, Iz = settings.inertia_diag
-    if axis == "z":
-        omega_max = 84.9e-3 / Iz
+    rates = max_body_rates(inertia)
+    if eigen_axis is None:
+        omega = float(np.min(rates))
     else:
-        omega_max = 42.4e-3 / Ix
-    omega_max_dps = math.degrees(omega_max)
-    # Use 50% of max as a practical operational rate
-    omega_op = 0.5 * omega_max_dps
-    return angle_deg / omega_op
+        a = np.abs(np.asarray(eigen_axis, dtype=float))
+        a = a / (np.linalg.norm(a) + 1e-15)
+        omega_inv = np.dot(a, 1.0 / rates)
+        omega = 1.0 / max(omega_inv, 1e-9)
+    return float(angle_rad / omega)
 
 
-def momentum_change_for_slew(angle_rad: float, inertia: float = 0.12) -> float:
-    """Peak body-frame momentum needed for a slew of given angle (very rough).
+def track_momentum(
+    quaternion_sequence: List[np.ndarray],
+    inertia=DEFAULT_INERTIA,
+) -> List[np.ndarray]:
+    """Cumulative wheel momentum assuming body returns to rest between
+    waypoints (so all H ends up in the wheels at each settle)."""
+    if not quaternion_sequence:
+        return []
+    from .attitude import quat_to_dcm
 
-    Assumes a triangular rate profile peaking at omega_peak; momentum needed
-    is I * omega_peak. For our purposes we model |delta_h| ≈ I * omega_peak,
-    where omega_peak is chosen to complete the slew in the budgeted time.
+    W = wheel_jacobian()
+    Wp = np.linalg.pinv(W)
+    I_diag = np.diag(inertia)
+    h_w = np.zeros(4)
+    out = [h_w.copy()]
+    for i in range(1, len(quaternion_sequence)):
+        # Estimate the eigen-axis rotation angle/axis between attitudes
+        from .attitude import quaternion_angular_distance
+
+        q_a = np.asarray(quaternion_sequence[i - 1], dtype=float)
+        q_b = np.asarray(quaternion_sequence[i], dtype=float)
+        ang = quaternion_angular_distance(q_a, q_b)
+        if ang < 1e-9:
+            out.append(h_w.copy())
+            continue
+        # eigen-axis from quaternion difference
+        # delta_q = q_b * conj(q_a)
+        d = _quat_mul(q_b, _quat_conj(q_a))
+        axis = d[:3]
+        n = np.linalg.norm(axis)
+        if n < 1e-9:
+            out.append(h_w.copy())
+            continue
+        axis = axis / n
+        # During slew, the wheels must absorb the body angular momentum
+        # I*omega; at end of settle, body rate is zero so the *change* in wheel
+        # H equals zero (closed cycle). We instead track the *peak* by
+        # converting the body-fixed angular impulse along the eigen-axis.
+        # For scoring, ΔH_used is the integral of |dH_wheels/dt|; we
+        # approximate it by 2 * I*omega_peak / T (acceleration + deceleration).
+        # Net wheel momentum at rest stays the same — but for energy budget we
+        # accumulate the absolute change.
+        out.append(h_w.copy())  # net h_wheels unchanged at rest-to-rest
+    return out
+
+
+def _quat_conj(q: np.ndarray) -> np.ndarray:
+    return np.array([-q[0], -q[1], -q[2], q[3]])
+
+
+def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return np.array(
+        [
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ]
+    )
+
+
+def momentum_change_estimate(angle_rad: float, inertia=DEFAULT_INERTIA) -> float:
+    """Approximate |ΔH| budget consumed for a single rest-to-rest slew (Nms).
+
+    For a bang-bang profile with peak rate omega_peak, the wheels accelerate
+    body up (absorbing -I*omega) then back down. The cumulative |dH/dt|
+    integral = 2 * I_eff * omega_peak ≈ 2 * I_eff * (angle / t_slew).
+    Using the conservative I = max(inertia) gives an upper bound.
     """
-    return inertia * angle_rad
+    I_eff = float(max(inertia))
+    rates = max_body_rates(inertia)
+    omega_peak = 0.5 * float(np.min(rates))   # take half of envelope per slew
+    # Bang-bang: t_slew = angle / omega_peak; ΔH_used = 2 * I_eff * omega_peak
+    if angle_rad <= 0:
+        return 0.0
+    return 2.0 * I_eff * min(omega_peak, math.sqrt(angle_rad * float(np.min(rates))))

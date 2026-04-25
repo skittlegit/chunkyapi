@@ -4,10 +4,9 @@ import math
 from typing import List
 
 import numpy as np
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 
-from ..config import settings
-from ..core.attitude import estimate_body_rate
+from ..config import SHUTTER_DURATION_S
 from ..models.requests import ValidateRequest
 from ..models.responses import ValidateResponse, ValidationViolation
 
@@ -23,17 +22,18 @@ def validate(req: ValidateRequest) -> ValidateResponse:
     shutters = s.get("shutters", [])
 
     if not attitude:
-        violations.append(ValidationViolation(code="EMPTY_ATTITUDE", message="No attitude samples"))
+        violations.append(
+            ValidationViolation(code="EMPTY_ATTITUDE", message="No attitude samples")
+        )
         return ValidateResponse(ok=False, violations=violations)
 
-    # Quaternion norms & monotonic time
     prev_t = -math.inf
     for i, a in enumerate(attitude):
         try:
             t = float(a["t"])
             q = a["q_BN"]
             if len(q) != 4:
-                raise ValueError("len != 4")
+                raise ValueError("q_BN length != 4")
             qn = float(np.linalg.norm(q))
         except Exception as e:  # noqa: BLE001
             violations.append(
@@ -48,7 +48,7 @@ def validate(req: ValidateRequest) -> ValidateResponse:
             violations.append(
                 ValidationViolation(
                     code="QUAT_NORM",
-                    message=f"|q|={qn} (expected 1.0±1e-6)",
+                    message=f"|q|={qn} (expected 1.0+/-1e-6)",
                     location=f"attitude[{i}]",
                 )
             )
@@ -56,13 +56,12 @@ def validate(req: ValidateRequest) -> ValidateResponse:
             violations.append(
                 ValidationViolation(
                     code="TIME_NOT_MONOTONIC",
-                    message=f"t={t} < previous t={prev_t}",
+                    message=f"t={t} < previous {prev_t}",
                     location=f"attitude[{i}]",
                 )
             )
         prev_t = t
 
-    # First sample at t=0
     if attitude and float(attitude[0]["t"]) > 1e-6:
         violations.append(
             ValidationViolation(
@@ -71,7 +70,6 @@ def validate(req: ValidateRequest) -> ValidateResponse:
             )
         )
 
-    # Sample spacing >= 20ms (warn if any < 19ms — allow tiny float jitter)
     for i in range(1, len(attitude)):
         dt = float(attitude[i]["t"]) - float(attitude[i - 1]["t"])
         if 0.0 < dt < 0.019:
@@ -84,7 +82,6 @@ def validate(req: ValidateRequest) -> ValidateResponse:
             )
             break
 
-    # Shutter checks
     prev_end = -math.inf
     for i, sh in enumerate(shutters):
         try:
@@ -100,11 +97,11 @@ def validate(req: ValidateRequest) -> ValidateResponse:
                 )
             )
             continue
-        if abs(dur - settings.integration_time_s) > 1e-6:
+        if abs(dur - SHUTTER_DURATION_S) > 1e-6:
             violations.append(
                 ValidationViolation(
                     code="SHUTTER_DURATION",
-                    message=f"duration={dur} (expected {settings.integration_time_s})",
+                    message=f"duration={dur} (expected {SHUTTER_DURATION_S})",
                     location=f"shutters[{i}]",
                 )
             )
@@ -118,7 +115,6 @@ def validate(req: ValidateRequest) -> ValidateResponse:
             )
         prev_end = t1
 
-    # Last attitude sample must be at or after final shutter end
     if shutters:
         final_end = float(shutters[-1]["t_end"])
         last_att_t = float(attitude[-1]["t"])
