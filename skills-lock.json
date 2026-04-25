@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "skills": {
+    "astropy": {
+      "source": "smithery.ai",
+      "sourceType": "well-known",
+      "computedHash": "93585bf67a11ee7e73f0ad3f72e16185b720fd980a57fea6bff433511fe023c4"
+    },
+    "claude-scientific-skills": {
+      "source": "smithery.ai",
+      "sourceType": "well-known",
+      "computedHash": "cfd85ca08e86c8e8b9979362d1e36a66d6fd92417fdbfb0d78cb63e9b06f5c8d"
+    },
+    "orbital-mechanics": {
+      "source": "smithery.ai",
+      "sourceType": "well-known",
+      "computedHash": "03fd729d1536d50be7b85661c7df2a6d3546cae1e3eae2cfc4761cf20eb145f8"
+    },
+    "physics-tutor": {
+      "source": "smithery.ai",
+      "sourceType": "well-known",
+      "computedHash": "00594ecb267a1e873c0b5f1e7deb0b6d9365334193dd07d5be729071c0284391"
+    },
+    "scientific-problem-selection": {
+      "source": "smithery.ai",
+      "sourceType": "well-known",
+      "computedHash": "cf1bac49e30bc4b9026b8e86ec182d08d2b2692176ee510a8c17e97717668364"
+    }
+  }
+}
