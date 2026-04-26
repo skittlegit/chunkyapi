@@ -278,8 +278,16 @@ def _generate_tiles(aoi, off_ca):
     lat_lo, lat_hi, lon_lo, lon_hi = _aoi_bbox(aoi)
     clat = 0.5 * (lat_lo + lat_hi)
     nadir_fp_km = ALT_NOMINAL_M * np.tan(np.radians(FOV_DEG)) / 1000.0  # ~17.5 km
-    pitch_km = nadir_fp_km * max(0.55, np.cos(np.radians(off_ca))) * 1.15
-    pitch_km = max(11.0, min(pitch_km, 19.0))
+    # Near nadir: tighter pitch helps because footprints are not stretched
+    # by foreshortening; off-nadir: wider pitch matches stretched footprints.
+    if off_ca < 5.0:
+        scale = 0.95
+    elif off_ca < 20.0:
+        scale = 1.05
+    else:
+        scale = 1.15
+    pitch_km = nadir_fp_km * max(0.55, np.cos(np.radians(off_ca))) * scale
+    pitch_km = max(9.0, min(pitch_km, 19.0))
 
     d_lat = pitch_km / _km_per_deg_lat()
     d_lon = pitch_km / _km_per_deg_lon(clat)
@@ -516,20 +524,26 @@ def plan_imaging(tle_line1, tle_line2, aoi_polygon_llh,
         budget = base_budget           # 55 deg geodetic
     tiles, pitch_km = _generate_tiles(aoi_polygon_llh, off_ca)
 
+    # For each tile, scan the pass to find the time of MINIMUM off-nadir.
+    # This gives the greedy scheduler richer flexibility than anchoring
+    # tiles to sub-satellite-latitude crossings (which clusters t_pref).
     plan_pts = []
+    t_scan = np.arange(max(0.0, t_ca - 200.0),
+                       min(T, t_ca + 200.0) + 1e-6, 4.0)
     for (lat, lon) in tiles:
-        # Use sub-satellite latitude crossing time so cross-track-sibling
-        # tiles fire at the SAME time on different cross-track angles, while
-        # along-track tiles spread across the pass naturally.
-        t_pref = _time_for_subsat_lat(sat, lat, jd0, fr0, T, t_ca, dt=1.0)
-        # Validate off-nadir at t_pref using the SAME formula the scorer uses.
-        jd_p, fr_p = _add_seconds(jd0, fr0, t_pref)
-        r_sat_p, v_sat_p = _propagate(sat, jd_p, fr_p)
-        r_tgt_p = _llh_to_eci(lat, lon, jd_p, fr_p)
-        q_p = _attitude_pointing_at(r_sat_p, r_tgt_p, v_sat_p)
-        off_p = _off_nadir_at_target(q_p, r_sat_p, lat, lon, jd_p, fr_p)
-        if off_p <= budget:
-            plan_pts.append((t_pref, lat, lon, off_p))
+        best_off = 999.0
+        best_t = t_ca
+        for t in t_scan:
+            jd_t, fr_t = _add_seconds(jd0, fr0, float(t))
+            r_sat_t, v_sat_t = _propagate(sat, jd_t, fr_t)
+            r_tgt_t = _llh_to_eci(lat, lon, jd_t, fr_t)
+            q_t = _attitude_pointing_at(r_sat_t, r_tgt_t, v_sat_t)
+            off_t = _off_nadir_at_target(q_t, r_sat_t, lat, lon, jd_t, fr_t)
+            if off_t < best_off:
+                best_off = off_t
+                best_t = float(t)
+        if best_off <= budget:
+            plan_pts.append((best_t, lat, lon, best_off))
 
     # Sort by t_pref, breaking ties by tile order (already serpentine in lon).
     plan_pts.sort(key=lambda x: x[0])
