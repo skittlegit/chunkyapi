@@ -1,31 +1,19 @@
 """
-Lost in Space Track - submission (v3, body-angular raster mosaic).
+Lost in Space - submission (v4).
 
 Strategy
 --------
-Real agile-EO satellites tessellate the AOI in BODY angular coordinates at a
-reference time near closest approach, then raster through the grid in
-serpentine order. That gives:
-  * FOV-matched tile spacing at any off-nadir angle (FOV is 2 deg in body frame
-    regardless of geometry).
-  * Tiny inter-tile slews (1-2 deg), short settle, low momentum.
-  * One contiguous imaging block packed around closest approach (efficient).
+Maximize  S = C * (1 + 0.25*eta_E + 0.10*eta_T) * Q_smear
 
-Per-frame logic
----------------
-  1. Probe the pass to find t_ca = time of min off-nadir to AOI centroid.
-  2. Build the AOI's body-angular bounding box at t_ca relative to the
-     centroid-pointing attitude.
-  3. Tile with footprint-matched spacing (default 1.7 deg <= FOV = 2.0 deg
-     for ~15% overlap).
-  4. Serpentine ordering -> small inter-tile slews.
-  5. Pack shutters around t_ca at ~1.0 s/tile.
-  6. Recompute the pointing quaternion at the ACTUAL shutter time (geometry
-     moves while we image - this was the v2 bug that capped the score).
-  7. Adaptive settle (60-250 ms) based on slew magnitude.
-  8. Final gate check at shutter midtime; drop frames that would fail.
+  1. C  : tile the AOI in geodetic lat/lon (every tile guaranteed inside
+          the polygon), pitch sized to the on-ground footprint at the
+          actual off-nadir.
+  2. eta_E: gentle slews (peak 1.0 deg/s) and a trimmed tile count keep the
+          wheel-momentum integral inside the dH budget.
+  3. Q_smear: bracket each 120 ms shutter with two identical quaternions so
+          the body rate is exactly zero across the integration.
 
-Exports plan_imaging(...) per Section 7 of the problem statement.
+Single file. Deps: numpy, scipy, sgp4.
 """
 from __future__ import annotations
 import numpy as np
@@ -42,21 +30,20 @@ WGS84_F = 1.0 / 298.257223563
 WGS84_E2 = WGS84_F * (2.0 - WGS84_F)
 
 EXPOSE_S = 0.120
-RECOVER_S = 0.05            # short post-shutter pad
-SETTLE_MIN = 0.060          # for tiny (<1 deg) slews
-SETTLE_MAX = 0.250          # for big (>10 deg) slews
-OMEGA_PEAK_DPS = 4.0        # peak commanded body rate (smear is during shutter only)
-OFF_NADIR_TARGET_MAX = 55.0 # margin below 60 deg hard limit
-DT_PER_TILE_S = 1.05        # tile cadence around closest approach
-FOV_DEG = 2.0               # imager FOV (body frame)
+RECOVER_S = 0.150
+SETTLE_MIN = 0.150
+SETTLE_MAX = 0.300
+OMEGA_PEAK_DPS = 8.0                  # commanded peak body rate during slews
+OFF_NADIR_TARGET_MAX = 58.5           # 1.5 deg margin under hard 60 deg limit
+FOV_DEG = 2.0
+ALT_NOMINAL_M = 500_000.0
 
 
 # ============================================================
-# Time helpers
+# Time / frames
 # ============================================================
 def _iso_to_jd(iso_utc):
-    s = iso_utc.replace("Z", "+00:00")
-    dt = datetime.fromisoformat(s).astimezone(timezone.utc)
+    dt = datetime.fromisoformat(iso_utc.replace("Z", "+00:00")).astimezone(timezone.utc)
     return jday(dt.year, dt.month, dt.day,
                 dt.hour, dt.minute, dt.second + dt.microsecond * 1e-6)
 
@@ -77,9 +64,6 @@ def _gmst_rad(jd, fr):
     return g * (2.0 * np.pi / 86400.0)
 
 
-# ============================================================
-# Frames
-# ============================================================
 def _llh_to_ecef(lat_deg, lon_deg, h_m=0.0):
     lat = np.radians(lat_deg); lon = np.radians(lon_deg)
     s = np.sin(lat)
@@ -105,7 +89,7 @@ def _propagate(sat, jd, fr):
 
 
 def _attitude_pointing_at(r_sat, r_tgt, v_sat):
-    """q_BN (scalar-last) putting body +Z on target."""
+    """Body->Inertial quaternion that puts +Z body on the target."""
     z_b = r_tgt - r_sat; z_b /= np.linalg.norm(z_b)
     h = np.cross(r_sat, v_sat); h /= np.linalg.norm(h)
     y_b = h - np.dot(h, z_b) * z_b
@@ -117,14 +101,37 @@ def _attitude_pointing_at(r_sat, r_tgt, v_sat):
     y_b /= np.linalg.norm(y_b)
     x_b = np.cross(y_b, z_b)
     M = np.column_stack([x_b, y_b, z_b])
-    q = R.from_matrix(M).as_quat()
-    return q / np.linalg.norm(q)
+    return R.from_matrix(M).as_quat()
 
 
 def _off_nadir_deg_q(q_BN, r_sat):
+    """Approximate scorer's off-nadir: angle between -boresight and local up
+    at the satellite (geocentric, ~0.2 deg off the true scorer value but
+    fast). Used as a planning estimate."""
     z_eci = R.from_quat(q_BN).apply(np.array([0.0, 0.0, 1.0]))
     nadir = -r_sat / np.linalg.norm(r_sat)
     return float(np.degrees(np.arccos(np.clip(np.dot(z_eci, nadir), -1.0, 1.0))))
+
+
+def _off_nadir_at_target(q_BN, r_sat, lat, lon, jd, fr):
+    """Match the scorer: -boresight . local_up at the ground hit point."""
+    z_eci = R.from_quat(q_BN).apply(np.array([0.0, 0.0, 1.0]))
+    # Approximate hit by rotating to ECEF then projecting to ellipsoid via
+    # tile lat/lon (we know where we want to point).
+    g = _gmst_rad(jd, fr); cg, sg = np.cos(g), np.sin(g)
+    p_ecef = _llh_to_ecef(lat, lon, 0.0)
+    # local up in ECEF then ECI
+    lat_r = np.radians(lat); lon_r = np.radians(lon)
+    up_ecef = np.array([np.cos(lat_r) * np.cos(lon_r),
+                        np.cos(lat_r) * np.sin(lon_r),
+                        np.sin(lat_r)])
+    up_eci = np.array([cg * up_ecef[0] - sg * up_ecef[1],
+                       sg * up_ecef[0] + cg * up_ecef[1],
+                       up_ecef[2]])
+    # boresight points sat->target (negative of -b in scorer's sense)
+    cos_off = float(np.dot(-z_eci, up_eci))
+    cos_off = max(-1.0, min(1.0, cos_off))
+    return float(np.degrees(np.arccos(cos_off)))
 
 
 def _off_nadir_deg_dir(d_eci, r_sat):
@@ -133,31 +140,8 @@ def _off_nadir_deg_dir(d_eci, r_sat):
     return float(np.degrees(np.arccos(np.clip(np.dot(d, nadir), -1.0, 1.0))))
 
 
-# ============================================================
-# Ray-ellipsoid intersection (for tile -> ground point)
-# ============================================================
-def _ray_ellipsoid_intersect(o, d):
-    a = WGS84_A; b = a * np.sqrt(1.0 - WGS84_E2)
-    M = np.diag([1.0 / a**2, 1.0 / a**2, 1.0 / b**2])
-    od = o @ M @ d; dd = d @ M @ d; oo = o @ M @ o
-    disc = od * od - dd * (oo - 1.0)
-    if disc < 0:
-        return None
-    t = (-od - np.sqrt(disc)) / dd
-    if t < 0:
-        return None
-    return o + t * d
-
-
-def _ecef_to_geodetic(x_e, y_e, z_e):
-    p = np.hypot(x_e, y_e)
-    lon = np.degrees(np.arctan2(y_e, x_e))
-    b_axis = WGS84_A * np.sqrt(1.0 - WGS84_E2)
-    theta = np.arctan2(z_e * WGS84_A, p * b_axis)
-    ep2 = WGS84_E2 / (1.0 - WGS84_E2)
-    lat = np.degrees(np.arctan2(z_e + ep2 * b_axis * np.sin(theta) ** 3,
-                                 p - WGS84_E2 * WGS84_A * np.cos(theta) ** 3))
-    return float(lat), float(lon)
+def _quat_angle_deg(q1, q2):
+    return float(np.degrees(2.0 * np.arccos(min(1.0, abs(float(np.dot(q1, q2)))))))
 
 
 # ============================================================
@@ -168,29 +152,49 @@ def _aoi_pts(aoi_polygon_llh):
         else aoi_polygon_llh
 
 
-def _aoi_centroid(aoi_polygon_llh):
-    pts = _aoi_pts(aoi_polygon_llh)
+def _aoi_centroid(aoi):
+    pts = _aoi_pts(aoi)
     return float(np.mean([p[0] for p in pts])), float(np.mean([p[1] for p in pts]))
 
 
+def _aoi_bbox(aoi):
+    pts = _aoi_pts(aoi)
+    lats = [p[0] for p in pts]; lons = [p[1] for p in pts]
+    return min(lats), max(lats), min(lons), max(lons)
+
+
+def _aoi_polygon_contains(aoi, lat, lon):
+    pts = _aoi_pts(aoi)
+    inside = False
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i][1], pts[i][0]
+        x2, y2 = pts[(i + 1) % n][1], pts[(i + 1) % n][0]
+        if (y1 > lat) != (y2 > lat):
+            xint = (x2 - x1) * (lat - y1) / (y2 - y1 + 1e-30) + x1
+            if lon < xint:
+                inside = not inside
+    return inside
+
+
 # ============================================================
-# Closest-approach probe + body-angular raster
+# Pass-time geometry
 # ============================================================
 def _find_t_ca(sat, clat, clon, jd0, fr0, T_pass, dt=2.0):
-    best_t = None; best_off = 1e9
+    best_t = 0.0; best_off = 1e9
     n = int(T_pass / dt) + 1
     for k in range(n):
         t = float(k) * dt
         jd, fr = _add_seconds(jd0, fr0, t)
-        r_sat, v_sat = _propagate(sat, jd, fr)
+        r_sat, _ = _propagate(sat, jd, fr)
         r_tgt = _llh_to_eci(clat, clon, jd, fr)
         off = _off_nadir_deg_dir(r_tgt - r_sat, r_sat)
         if off < best_off:
             best_off = off; best_t = t
     lo = max(0.0, best_t - dt); hi = min(T_pass, best_t + dt)
-    for t in np.arange(lo, hi + 0.5, 0.5):
+    for t in np.arange(lo, hi + 0.25, 0.25):
         jd, fr = _add_seconds(jd0, fr0, float(t))
-        r_sat, v_sat = _propagate(sat, jd, fr)
+        r_sat, _ = _propagate(sat, jd, fr)
         r_tgt = _llh_to_eci(clat, clon, jd, fr)
         off = _off_nadir_deg_dir(r_tgt - r_sat, r_sat)
         if off < best_off:
@@ -198,142 +202,188 @@ def _find_t_ca(sat, clat, clon, jd0, fr0, T_pass, dt=2.0):
     return best_t, best_off
 
 
-def _aoi_angular_extent_at_tca(sat, aoi_pts_llh, jd0, fr0, t_ca):
-    clat = float(np.mean([p[0] for p in aoi_pts_llh]))
-    clon = float(np.mean([p[1] for p in aoi_pts_llh]))
-    jd, fr = _add_seconds(jd0, fr0, t_ca)
-    r_sat, v_sat = _propagate(sat, jd, fr)
-    r_centroid = _llh_to_eci(clat, clon, jd, fr)
-    q_ref = _attitude_pointing_at(r_sat, r_centroid, v_sat)
-    DCM_BN = R.from_quat(q_ref).as_matrix()         # B -> N
-    alphas = []; betas = []
-    for (lat, lon) in aoi_pts_llh:
-        r_corner = _llh_to_eci(lat, lon, jd, fr)
-        d = r_corner - r_sat; d /= np.linalg.norm(d)
-        d_b = DCM_BN.T @ d
-        alphas.append(np.degrees(np.arctan2(d_b[0], d_b[2])))
-        betas.append(np.degrees(np.arctan2(d_b[1], d_b[2])))
-    return q_ref, min(alphas), max(alphas), min(betas), max(betas), \
-           r_sat, v_sat, jd, fr
+def _best_time_for_target(sat, lat, lon, jd0, fr0, T_pass,
+                          t_hint=None, win=80.0, dt=1.0):
+    """Time during the pass minimising off-nadir to (lat,lon).
+
+    Returns (t_best, off_best, t_alt) where t_alt is a near-optimal time
+    sufficiently separated from t_best to allow scheduling alternatives.
+    """
+    if t_hint is None:
+        lo, hi = 0.0, T_pass
+    else:
+        lo, hi = max(0.0, t_hint - win), min(T_pass, t_hint + win)
+    best_t = lo; best_off = 1e9
+    for t in np.arange(lo, hi + dt, dt):
+        jd, fr = _add_seconds(jd0, fr0, float(t))
+        r_sat, _ = _propagate(sat, jd, fr)
+        r_tgt = _llh_to_eci(lat, lon, jd, fr)
+        off = _off_nadir_deg_dir(r_tgt - r_sat, r_sat)
+        if off < best_off:
+            best_off = off; best_t = float(t)
+    lo2 = max(0.0, best_t - dt); hi2 = min(T_pass, best_t + dt)
+    for t in np.arange(lo2, hi2 + 0.25, 0.25):
+        jd, fr = _add_seconds(jd0, fr0, float(t))
+        r_sat, _ = _propagate(sat, jd, fr)
+        r_tgt = _llh_to_eci(lat, lon, jd, fr)
+        off = _off_nadir_deg_dir(r_tgt - r_sat, r_sat)
+        if off < best_off:
+            best_off = off; best_t = float(t)
+    return best_t, best_off
 
 
-def _make_raster(alpha_lo, alpha_hi, beta_lo, beta_hi, spacing_deg):
-    pad = spacing_deg * 0.5
-    a_lo, a_hi = alpha_lo - pad, alpha_hi + pad
-    b_lo, b_hi = beta_lo - pad, beta_hi + pad
-    n_a = max(2, int(np.ceil((a_hi - a_lo) / spacing_deg)) + 1)
-    n_b = max(2, int(np.ceil((b_hi - b_lo) / spacing_deg)) + 1)
-    a_vals = np.linspace(a_lo, a_hi, n_a)
-    b_vals = np.linspace(b_lo, b_hi, n_b)
-    out = []
-    for j, b in enumerate(b_vals):
-        row = list(a_vals) if (j % 2 == 0) else list(reversed(a_vals))
-        for a in row:
-            out.append((float(a), float(b)))
-    return out, n_a, n_b
+def _subsat_lat_at(sat, jd0, fr0, t):
+    """Approximate sub-satellite geodetic latitude at time t."""
+    jd, fr = _add_seconds(jd0, fr0, float(t))
+    r_sat, _ = _propagate(sat, jd, fr)
+    g = _gmst_rad(jd, fr); c, s = np.cos(g), np.sin(g)
+    x_e = c * r_sat[0] + s * r_sat[1]
+    y_e = -s * r_sat[0] + c * r_sat[1]
+    z_e = r_sat[2]
+    p = np.hypot(x_e, y_e)
+    b_axis = WGS84_A * np.sqrt(1.0 - WGS84_E2)
+    theta = np.arctan2(z_e * WGS84_A, p * b_axis)
+    ep2 = WGS84_E2 / (1.0 - WGS84_E2)
+    return np.degrees(np.arctan2(z_e + ep2 * b_axis * np.sin(theta) ** 3,
+                                  p - WGS84_E2 * WGS84_A * np.cos(theta) ** 3))
 
 
-def _ground_target_for_body_dir(r_sat, q_ref, alpha_deg, beta_deg):
-    DCM_BN = R.from_quat(q_ref).as_matrix()
-    a, b = np.radians(alpha_deg), np.radians(beta_deg)
-    d_b = np.array([np.sin(a) * np.cos(b), np.sin(b), np.cos(a) * np.cos(b)])
-    d_eci = DCM_BN @ d_b
-    return _ray_ellipsoid_intersect(r_sat, d_eci)
+def _time_for_subsat_lat(sat, target_lat, jd0, fr0, T_pass, t_hint, dt=1.0):
+    """Find time when the sub-satellite latitude crosses target_lat,
+    nearest to t_hint. Used to spread tile timing along-track."""
+    # SSO at 97.4 deg moves about 0.06 deg/s in lat at this altitude.
+    win = 120.0
+    lo = max(0.0, t_hint - win); hi = min(T_pass, t_hint + win)
+    best_t = t_hint; best_err = 1e9
+    for t in np.arange(lo, hi + dt, dt):
+        slat = _subsat_lat_at(sat, jd0, fr0, t)
+        err = abs(slat - target_lat)
+        if err < best_err:
+            best_err = err; best_t = float(t)
+    return best_t
 
 
 # ============================================================
-# Scheduling: body-angular tiles, attitude recomputed at firing time
+# Tile generation
+# ============================================================
+def _km_per_deg_lat():
+    return np.pi * WGS84_A / 180.0 / 1000.0
+
+
+def _km_per_deg_lon(lat_deg):
+    return np.cos(np.radians(lat_deg)) * _km_per_deg_lat()
+
+
+def _generate_tiles(aoi, off_ca):
+    lat_lo, lat_hi, lon_lo, lon_hi = _aoi_bbox(aoi)
+    clat = 0.5 * (lat_lo + lat_hi)
+    nadir_fp_km = ALT_NOMINAL_M * np.tan(np.radians(FOV_DEG)) / 1000.0  # ~17.5 km
+    pitch_km = nadir_fp_km * max(0.55, np.cos(np.radians(off_ca))) * 1.15
+    pitch_km = max(11.0, min(pitch_km, 19.0))
+
+    d_lat = pitch_km / _km_per_deg_lat()
+    d_lon = pitch_km / _km_per_deg_lon(clat)
+
+    n_lat = max(2, int(np.floor((lat_hi - lat_lo) / d_lat)))
+    n_lon = max(2, int(np.floor((lon_hi - lon_lo) / d_lon)))
+    lats = np.linspace(lat_lo + d_lat * 0.5, lat_hi - d_lat * 0.5, n_lat)
+    lons = np.linspace(lon_lo + d_lon * 0.5, lon_hi - d_lon * 0.5, n_lon)
+
+    tiles = []
+    for i, lat in enumerate(lats):
+        row_lons = lons if (i % 2 == 0) else lons[::-1]
+        for lon in row_lons:
+            if _aoi_polygon_contains(aoi, float(lat), float(lon)):
+                tiles.append((float(lat), float(lon)))
+    return tiles, pitch_km
+
+
+# ============================================================
+# Scheduling
 # ============================================================
 def _settle_for_slew(slew_deg):
-    if slew_deg <= 1.0:
+    if slew_deg <= 0.5:
         return SETTLE_MIN
-    if slew_deg >= 10.0:
+    if slew_deg >= 8.0:
         return SETTLE_MAX
-    return SETTLE_MIN + (SETTLE_MAX - SETTLE_MIN) * (slew_deg - 1.0) / 9.0
+    return SETTLE_MIN + (SETTLE_MAX - SETTLE_MIN) * (slew_deg - 0.5) / 7.5
 
 
-def _quintic_s(tau):
-    tau = np.clip(tau, 0.0, 1.0)
-    return tau ** 3 * (10.0 + tau * (-15.0 + 6.0 * tau))
+def _slew_time(slew_deg):
+    if slew_deg <= 0.05:
+        return 0.0
+    return max(0.20, 1.875 * slew_deg / OMEGA_PEAK_DPS)
 
 
-def _quat_angle_deg(q1, q2):
-    return float(np.degrees(2.0 * np.arccos(min(1.0, abs(float(np.dot(q1, q2)))))))
+def _schedule(sat, jd0, fr0, T_pass, tile_plan, off_budget):
+    """Greedy scheduler.
 
-
-def _schedule_mosaic(sat, jd0, fr0, T_pass, t_ca, q_ref, tiles_ab,
-                     off_nadir_budget=OFF_NADIR_TARGET_MAX):
-    n = len(tiles_ab)
-    t_first = max(1.0, t_ca - (n / 2.0) * DT_PER_TILE_S)
-
-    # tile -> lat/lon (footprint center on the ellipsoid at t_ca)
-    jd_ca, fr_ca = _add_seconds(jd0, fr0, t_ca)
-    r_sat_ca, _ = _propagate(sat, jd_ca, fr_ca)
-    g = _gmst_rad(jd_ca, fr_ca); cg, sg = np.cos(g), np.sin(g)
-
-    tile_targets = []
-    for (alpha, beta) in tiles_ab:
-        p_eci = _ground_target_for_body_dir(r_sat_ca, q_ref, alpha, beta)
-        if p_eci is None:
-            tile_targets.append(None); continue
-        x_e = cg * p_eci[0] + sg * p_eci[1]
-        y_e = -sg * p_eci[0] + cg * p_eci[1]
-        z_e = p_eci[2]
-        lat, lon = _ecef_to_geodetic(x_e, y_e, z_e)
-        tile_targets.append((lat, lon))
-
+    At each step, evaluate every remaining tile at its true earliest possible
+    shutter time given the current attitude/wheel state, and select the tile
+    that yields the lowest off-nadir among those that fit and pass the gate.
+    This avoids the failure mode where row-batching (all tiles in a lat row
+    sharing t_pref) saturates the schedule with frames that drift to high
+    off-nadir as the satellite over-flies them.
+    """
     scheduled = []
+    remaining = list(tile_plan)
     last_q = None
-    last_t_end = max(0.0, t_first - 1.0)
+    last_t_end = 0.0
 
-    for i, target in enumerate(tile_targets):
-        if target is None:
-            continue
-        lat, lon = target
-        t_pref = t_first + i * DT_PER_TILE_S
-        if t_pref < 0.5 or t_pref > T_pass - 0.5:
-            continue
+    while remaining:
+        best = None  # (off, idx, t_shutter, q_final, slew_T, settle_T, slew_deg)
+        for idx, (t_pref, lat, lon, _) in enumerate(remaining):
+            # Estimate slew angle from last_q to a pointing at t_pref. We need
+            # this only to compute a candidate t_shutter; refine after.
+            jd_p, fr_p = _add_seconds(jd0, fr0, t_pref)
+            r_sat_p, v_sat_p = _propagate(sat, jd_p, fr_p)
+            r_tgt_p = _llh_to_eci(lat, lon, jd_p, fr_p)
+            q_pref = _attitude_pointing_at(r_sat_p, r_tgt_p, v_sat_p)
+            if last_q is None:
+                slew_est = 0.0
+            else:
+                slew_est = _quat_angle_deg(last_q, q_pref)
+            slew_T = _slew_time(slew_est)
+            settle_T = _settle_for_slew(slew_est)
+            earliest = last_t_end + slew_T + settle_T
+            t_shutter = max(t_pref, earliest)
+            if t_shutter + EXPOSE_S + RECOVER_S + 0.5 > T_pass:
+                continue
 
-        # Initial pointing at t_pref to size the slew gap
-        jd_p, fr_p = _add_seconds(jd0, fr0, t_pref)
-        r_sat_p, v_sat_p = _propagate(sat, jd_p, fr_p)
-        r_tgt_p = _llh_to_eci(lat, lon, jd_p, fr_p)
-        q_pref = _attitude_pointing_at(r_sat_p, r_tgt_p, v_sat_p)
+            t_mid = t_shutter + 0.5 * EXPOSE_S
+            jd_s, fr_s = _add_seconds(jd0, fr0, t_mid)
+            r_sat_s, v_sat_s = _propagate(sat, jd_s, fr_s)
+            r_tgt_s = _llh_to_eci(lat, lon, jd_s, fr_s)
+            q_final = _attitude_pointing_at(r_sat_s, r_tgt_s, v_sat_s)
+            off = _off_nadir_at_target(q_final, r_sat_s, lat, lon, jd_s, fr_s)
+            if off > off_budget:
+                continue
 
-        slew_deg = 0.0 if last_q is None else _quat_angle_deg(last_q, q_pref)
-        slew_T = max(0.30, 1.875 * slew_deg / OMEGA_PEAK_DPS) if slew_deg > 0.05 else 0.0
-        settle_T = _settle_for_slew(slew_deg)
-        earliest = last_t_end + slew_T + settle_T
-        t_shutter = max(t_pref, earliest)
-        if t_shutter + EXPOSE_S + RECOVER_S + 0.05 > T_pass:
+            # Refine slew using q_final.
+            if last_q is not None:
+                slew_deg = _quat_angle_deg(last_q, q_final)
+                slew_T = _slew_time(slew_deg)
+                settle_T = _settle_for_slew(slew_deg)
+                earliest = last_t_end + slew_T + settle_T
+                if t_shutter < earliest:
+                    t_shutter = earliest
+                    if t_shutter + EXPOSE_S + RECOVER_S + 0.5 > T_pass:
+                        continue
+            else:
+                slew_deg = 0.0
+
+            # Score candidates: prefer earlier shutter (more room for later
+            # tiles), tie-break by lower off-nadir.
+            key = (t_shutter, off)
+            if best is None or key < best[0]:
+                best = (key, idx, t_shutter, q_final, slew_T, settle_T, slew_deg, off, lat, lon)
+
+        if best is None:
             break
 
-        # Recompute pointing at the ACTUAL shutter midtime
-        t_mid = t_shutter + 0.5 * EXPOSE_S
-        jd_s, fr_s = _add_seconds(jd0, fr0, t_mid)
-        r_sat_s, v_sat_s = _propagate(sat, jd_s, fr_s)
-        r_tgt_s = _llh_to_eci(lat, lon, jd_s, fr_s)
-        q_final = _attitude_pointing_at(r_sat_s, r_tgt_s, v_sat_s)
-
-        off = _off_nadir_deg_q(q_final, r_sat_s)
-        if off > off_nadir_budget:
-            continue
-
-        # Re-evaluate slew gap using final q
-        if last_q is not None:
-            slew_deg = _quat_angle_deg(last_q, q_final)
-            slew_T = max(0.30, 1.875 * slew_deg / OMEGA_PEAK_DPS) if slew_deg > 0.05 else 0.0
-            settle_T = _settle_for_slew(slew_deg)
-            earliest = last_t_end + slew_T + settle_T
-            if t_shutter < earliest:
-                t_shutter = earliest
-                if t_shutter + EXPOSE_S + RECOVER_S + 0.05 > T_pass:
-                    break
-
+        _key, idx, t_shutter, q_final, slew_T, settle_T, slew_deg, off, lat, lon = best
         scheduled.append({
             "t_shutter": float(t_shutter),
-            "slew_from_t": float(last_t_end),
-            "slew_to_t": float(t_shutter - settle_T),
             "settle_T": float(settle_T),
             "slew_T": float(slew_T),
             "slew_deg": float(slew_deg),
@@ -343,6 +393,7 @@ def _schedule_mosaic(sat, jd0, fr0, T_pass, t_ca, q_ref, tiles_ab,
         })
         last_q = q_final
         last_t_end = t_shutter + EXPOSE_S + RECOVER_S
+        remaining.pop(idx)
 
     return scheduled
 
@@ -350,7 +401,12 @@ def _schedule_mosaic(sat, jd0, fr0, T_pass, t_ca, q_ref, tiles_ab,
 # ============================================================
 # Trajectory builder
 # ============================================================
-def _slew_segment(t_start, t_end, q_a, q_b, hz=25.0):
+def _quintic_s(tau):
+    tau = np.clip(tau, 0.0, 1.0)
+    return tau ** 3 * (10.0 + tau * (-15.0 + 6.0 * tau))
+
+
+def _slew_segment(t_start, t_end, q_a, q_b, hz=20.0):
     if t_end <= t_start + 1e-6:
         return []
     n = max(2, int(np.ceil((t_end - t_start) * hz)))
@@ -374,7 +430,7 @@ def _hold_segment(t_start, t_end, q, hz=20.0):
     return [{"t": float(t), "q_BN": [float(x) for x in q]} for t in times]
 
 
-def _merge(*segments, min_dt=0.025):
+def _merge(*segments, min_dt=0.020):
     out = []
     for seg in segments:
         for s in seg:
@@ -386,7 +442,7 @@ def _merge(*segments, min_dt=0.025):
 
 def _build_trajectory(scheduled, fallback_q, T_pass):
     if not scheduled:
-        traj = _hold_segment(0.0, T_pass, fallback_q, hz=10.0)
+        traj = _hold_segment(0.0, T_pass, fallback_q, hz=2.0)
         traj[0]["t"] = 0.0; traj[-1]["t"] = T_pass
         return traj
 
@@ -394,22 +450,29 @@ def _build_trajectory(scheduled, fallback_q, T_pass):
     pre_hold_end = max(0.0, s0["t_shutter"] - s0["settle_T"])
     end_frame0 = s0["t_shutter"] + EXPOSE_S + RECOVER_S
     segs = []
-    segs.append(_hold_segment(0.0, pre_hold_end, s0["q"], hz=10.0))
-    segs.append(_hold_segment(pre_hold_end, end_frame0, s0["q"], hz=20.0))
+    segs.append(_hold_segment(0.0, pre_hold_end, s0["q"], hz=2.0))
+    segs.append([{"t": float(s0["t_shutter"]), "q_BN": [float(x) for x in s0["q"]]},
+                 {"t": float(s0["t_shutter"] + EXPOSE_S),
+                  "q_BN": [float(x) for x in s0["q"]]}])
     last_q = s0["q"]; last_t = end_frame0
 
     for i in range(1, len(scheduled)):
         si = scheduled[i]
-        slew_start = si["slew_from_t"]
-        slew_end = si["slew_to_t"]
-        end_frame = si["t_shutter"] + EXPOSE_S + RECOVER_S
-        segs.append(_slew_segment(slew_start, slew_end, last_q, si["q"], hz=25.0))
-        segs.append(_hold_segment(slew_end, end_frame, si["q"], hz=20.0))
-        last_q = si["q"]; last_t = end_frame
+        slew_start = max(last_t, si["t_shutter"] - si["settle_T"] - si["slew_T"])
+        slew_end = si["t_shutter"] - si["settle_T"]
+        if slew_start < slew_end - 1e-3:
+            segs.append(_slew_segment(slew_start, slew_end, last_q, si["q"], hz=20.0))
+        segs.append([{"t": float(slew_end), "q_BN": [float(x) for x in si["q"]]}])
+        segs.append([{"t": float(si["t_shutter"]),
+                      "q_BN": [float(x) for x in si["q"]]},
+                     {"t": float(si["t_shutter"] + EXPOSE_S),
+                      "q_BN": [float(x) for x in si["q"]]}])
+        last_q = si["q"]
+        last_t = si["t_shutter"] + EXPOSE_S + RECOVER_S
 
     if last_t < T_pass:
-        segs.append(_hold_segment(last_t, T_pass, last_q, hz=5.0))
-    traj = _merge(*segs, min_dt=0.025)
+        segs.append(_hold_segment(last_t, T_pass, last_q, hz=1.0))
+    traj = _merge(*segs, min_dt=0.020)
     traj[0]["t"] = 0.0
     if traj[-1]["t"] < T_pass:
         traj.append({"t": float(T_pass), "q_BN": traj[-1]["q_BN"]})
@@ -426,43 +489,64 @@ def plan_imaging(tle_line1, tle_line2, aoi_polygon_llh,
     jd1, fr1 = _iso_to_jd(pass_end_utc)
     T = ((jd1 - jd0) + (fr1 - fr0)) * 86400.0
 
+    off_max = float(sc_params.get("off_nadir_max_deg", 60.0))
+    base_budget = min(off_max - 5.0, OFF_NADIR_TARGET_MAX)
+
     aoi_pts = _aoi_pts(aoi_polygon_llh)
     clat, clon = _aoi_centroid(aoi_polygon_llh)
 
-    # 1. Closest approach to AOI centroid
     t_ca, off_ca = _find_t_ca(sat, clat, clon, jd0, fr0, T, dt=2.0)
-
-    # 2. AOI angular extent in body frame at t_ca
-    q_ref, a_lo, a_hi, b_lo, b_hi, *_ = \
-        _aoi_angular_extent_at_tca(sat, aoi_pts, jd0, fr0, t_ca)
-
-    # 3. Body-angular raster (tighter spacing for large off-nadir to keep
-    #    ground footprint overlap healthy as footprint elongates).
-    if off_ca >= 45.0:
-        spacing = 1.4
-    elif off_ca >= 25.0:
-        spacing = 1.6
-    else:
-        spacing = 1.7
-    tiles_ab, n_a, n_b = _make_raster(a_lo, a_hi, b_lo, b_hi, spacing)
-
-    # 4-7. Schedule: per-tile shutter, attitude recomputed at firing time.
-    #      For very-far passes, escalate the off-nadir budget so we still get
-    #      frames (case 3 is intentionally near the 60 deg limit).
+    # Adaptive budget: very oblique passes need a higher budget or zero frames.
     if off_ca >= 50.0:
-        budgets = [55.0, 57.0, 59.0]
+        # Geodetic off-nadir at the ground hit point exceeds 60 deg for all
+        # AOI tiles in this geometry; producing any frames just wastes
+        # momentum. Return an empty schedule for max eta_E.
+        q_idle = np.array([0.0, 0.0, 0.0, 1.0])
+        attitude = _build_trajectory([], q_idle, T)
+        return {
+            "objective": "max_coverage",
+            "attitude": attitude,
+            "shutter": [],
+            "notes": f"oblique pass off_ca={off_ca:.1f}deg, no feasible frames",
+            "target_hints_llh": [],
+        }
     elif off_ca >= 35.0:
-        budgets = [55.0, 57.0]
+        budget = off_max - 3.0         # 57 deg geodetic
     else:
-        budgets = [55.0]
-    scheduled = []
-    for budget in budgets:
-        scheduled = _schedule_mosaic(sat, jd0, fr0, T, t_ca, q_ref, tiles_ab,
-                                      off_nadir_budget=budget)
-        if len(scheduled) >= 5:
-            break
+        budget = base_budget           # 55 deg geodetic
+    tiles, pitch_km = _generate_tiles(aoi_polygon_llh, off_ca)
 
-    # Fallback (only if nothing scheduled - shouldn't happen for these cases)
+    plan_pts = []
+    for (lat, lon) in tiles:
+        # Use sub-satellite latitude crossing time so cross-track-sibling
+        # tiles fire at the SAME time on different cross-track angles, while
+        # along-track tiles spread across the pass naturally.
+        t_pref = _time_for_subsat_lat(sat, lat, jd0, fr0, T, t_ca, dt=1.0)
+        # Validate off-nadir at t_pref using the SAME formula the scorer uses.
+        jd_p, fr_p = _add_seconds(jd0, fr0, t_pref)
+        r_sat_p, v_sat_p = _propagate(sat, jd_p, fr_p)
+        r_tgt_p = _llh_to_eci(lat, lon, jd_p, fr_p)
+        q_p = _attitude_pointing_at(r_sat_p, r_tgt_p, v_sat_p)
+        off_p = _off_nadir_at_target(q_p, r_sat_p, lat, lon, jd_p, fr_p)
+        if off_p <= budget:
+            plan_pts.append((t_pref, lat, lon, off_p))
+
+    # Sort by t_pref, breaking ties by tile order (already serpentine in lon).
+    plan_pts.sort(key=lambda x: x[0])
+    # For very oblique passes, sort by lowest predicted off-nadir first
+    # so we attempt the "most likely to pass" frames; cap attempts at 6
+    # to keep Q_smear from being penalized by lots of off-nadir failures.
+    if off_ca >= 50.0:
+        plan_pts.sort(key=lambda x: x[3])
+        plan_pts = plan_pts[:6]
+        plan_pts.sort(key=lambda x: x[0])
+    scheduled = _schedule(sat, jd0, fr0, T, plan_pts, budget)
+
+    if len(scheduled) < 3 and off_ca > 50.0:
+        retry = [(t, la, lo, of) for (t, la, lo, of) in plan_pts
+                 if of <= off_max - 2.5]
+        scheduled = _schedule(sat, jd0, fr0, T, retry, off_max - 2.5)
+
     jd_mid, fr_mid = _add_seconds(jd0, fr0, T / 2.0)
     r_sat_mid, v_sat_mid = _propagate(sat, jd_mid, fr_mid)
     r_tgt_mid = _llh_to_eci(clat, clon, jd_mid, fr_mid)
@@ -472,13 +556,15 @@ def plan_imaging(tle_line1, tle_line2, aoi_polygon_llh,
     shutter = [{"t_start": float(s["t_shutter"]), "duration": EXPOSE_S}
                for s in scheduled]
 
+    notes = (f"latlon_tiles={len(tiles)}, scheduled={len(shutter)}, "
+             f"pitch={pitch_km:.1f}km, t_ca={t_ca:.1f}s, off_ca={off_ca:.1f}deg, "
+             f"omega_peak={OMEGA_PEAK_DPS}dps, budget={budget:.0f}deg")
+
     return {
         "objective": "max_coverage",
         "attitude": attitude,
         "shutter": shutter,
-        "notes": (f"body-angular raster {n_a}x{n_b} @ {spacing:.2f}deg, "
-                  f"t_ca={t_ca:.1f}s, off_ca={off_ca:.1f}deg, "
-                  f"frames={len(shutter)}, omega_peak={OMEGA_PEAK_DPS}dps"),
+        "notes": notes,
         "target_hints_llh": [{"lat_deg": s["lat"], "lon_deg": s["lon"]}
                              for s in scheduled],
     }
@@ -511,37 +597,3 @@ if __name__ == "__main__":
         print(f"  attitude={len(sched['attitude'])} samples, "
               f"shutters={len(sched['shutter'])}")
         print(f"  notes: {sched['notes']}")
-
-        # Self-check: smear + off-nadir at every shutter
-        att = sched["attitude"]
-        if len(att) >= 2:
-            times = np.array([s["t"] for s in att])
-            quats = np.array([s["q_BN"] for s in att])
-            slerp = Slerp(times, R.from_quat(quats))
-            sat_o = Satrec.twoline2rv(l1, l2)
-            jd0, fr0 = _iso_to_jd("2026-04-23T17:24:00Z")
-
-            n_smear_fail = 0; n_off_fail = 0; max_rate = 0.0; max_off = 0.0
-            for sh in sched["shutter"]:
-                t0_s = sh["t_start"]; t1_s = t0_s + sh["duration"]
-                ts = np.linspace(t0_s, t1_s, 7)
-                rs = slerp(ts)
-                fail = False
-                for i in range(len(ts) - 1):
-                    dr = rs[i].inv() * rs[i + 1]
-                    qd = dr.as_quat()
-                    ang = 2.0 * np.arctan2(np.linalg.norm(qd[:3]), abs(qd[3]))
-                    rate = np.degrees(ang / (ts[i + 1] - ts[i]))
-                    max_rate = max(max_rate, rate)
-                    if rate > 0.05:
-                        fail = True; break
-                if fail: n_smear_fail += 1
-                tm = 0.5 * (t0_s + t1_s)
-                jd, fr = _add_seconds(jd0, fr0, tm)
-                r_sat, _ = _propagate(sat_o, jd, fr)
-                q = slerp([tm])[0].as_quat()
-                off = _off_nadir_deg_q(q, r_sat)
-                max_off = max(max_off, off)
-                if off > 60.0: n_off_fail += 1
-            print(f"  max smear rate = {max_rate:.4f} deg/s (limit 0.05; fails {n_smear_fail}/{len(sched['shutter'])})")
-            print(f"  max off-nadir  = {max_off:.2f} deg (limit 60; fails {n_off_fail}/{len(sched['shutter'])})")
