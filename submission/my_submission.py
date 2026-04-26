@@ -554,7 +554,7 @@ def plan_imaging(tle_line1, tle_line2, aoi_polygon_llh,
         plan_pts.sort(key=lambda x: x[3])
         plan_pts = plan_pts[:6]
         plan_pts.sort(key=lambda x: x[0])
-    scheduled = _schedule(sat, jd0, fr0, T, plan_pts, budget)
+    scheduled = _schedule(sat, jd0, fr0, T, plan_pts, min(off_max - 0.5, 59.5))
 
     if len(scheduled) < 3 and off_ca > 50.0:
         retry = [(t, la, lo, of) for (t, la, lo, of) in plan_pts
