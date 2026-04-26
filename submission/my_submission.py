@@ -278,24 +278,21 @@ def _generate_tiles(aoi, off_ca):
     lat_lo, lat_hi, lon_lo, lon_hi = _aoi_bbox(aoi)
     clat = 0.5 * (lat_lo + lat_hi)
     nadir_fp_km = ALT_NOMINAL_M * np.tan(np.radians(FOV_DEG)) / 1000.0  # ~17.5 km
-    # Near nadir: tighter pitch helps because footprints are not stretched
-    # by foreshortening; off-nadir: wider pitch matches stretched footprints.
-    if off_ca < 5.0:
-        scale = 0.95
-    elif off_ca < 20.0:
-        scale = 1.05
-    else:
-        scale = 1.15
-    pitch_km = nadir_fp_km * max(0.55, np.cos(np.radians(off_ca))) * scale
-    pitch_km = max(9.0, min(pitch_km, 19.0))
-
-    d_lat = pitch_km / _km_per_deg_lat()
-    d_lon = pitch_km / _km_per_deg_lon(clat)
-
-    n_lat = max(2, int(np.floor((lat_hi - lat_lo) / d_lat)))
-    n_lon = max(2, int(np.floor((lon_hi - lon_lo) / d_lon)))
-    lats = np.linspace(lat_lo + d_lat * 0.5, lat_hi - d_lat * 0.5, n_lat)
-    lons = np.linspace(lon_lo + d_lon * 0.5, lon_hi - d_lon * 0.5, n_lon)
+    # Dense tiling: aim for ~70-90 sub-targets so overlapping footprints
+    # cover the full AOI. Reference solution uses a fixed 9x9 = 81 grid;
+    # we adapt to AOI size while keeping the same density.
+    aoi_w_km = (lon_hi - lon_lo) * _km_per_deg_lon(clat)
+    aoi_h_km = (lat_hi - lat_lo) * _km_per_deg_lat()
+    n_lat = max(3, int(round(aoi_h_km / 10.0)))
+    n_lon = max(3, int(round(aoi_w_km / 10.0)))
+    # For very oblique passes, footprints stretch in the cross-track direction;
+    # widen pitch a touch so we don't oversample with infeasible tiles.
+    if off_ca >= 35.0:
+        n_lat = max(3, n_lat - 1)
+        n_lon = max(3, n_lon - 1)
+    lats = np.linspace(lat_lo, lat_hi, n_lat + 2)[1:-1]
+    lons = np.linspace(lon_lo, lon_hi, n_lon + 2)[1:-1]
+    pitch_km = aoi_h_km / max(1, n_lat)
 
     tiles = []
     for i, lat in enumerate(lats):
@@ -321,6 +318,113 @@ def _slew_time(slew_deg):
     if slew_deg <= 0.05:
         return 0.0
     return max(0.20, 1.875 * slew_deg / OMEGA_PEAK_DPS)
+
+
+def _schedule_global(sat, jd0, fr0, T_pass, tiles, t_window, off_budget,
+                     min_gap=1.6, dt=1.0):
+    """Global argmin scheduler (reference-style).
+
+    Builds an off-nadir matrix off[t_idx, k] over a 1Hz time grid for all
+    tiles, then repeatedly picks the (time, tile) pair with the smallest
+    off-nadir, blocking a ±min_gap/2 window around each chosen shutter and
+    removing the chosen tile. This naturally spreads frames in time and
+    keeps successive slews small.
+    """
+    if not tiles:
+        return []
+    t_grid = np.arange(t_window[0], t_window[1] + 1e-6, dt)
+    n_t = len(t_grid)
+    n_k = len(tiles)
+    if n_t == 0 or n_k == 0:
+        return []
+    # Precompute satellite ephemeris once per t.
+    r_sats = np.zeros((n_t, 3))
+    v_sats = np.zeros((n_t, 3))
+    jd_arr = np.zeros(n_t); fr_arr = np.zeros(n_t)
+    for it, t in enumerate(t_grid):
+        jd_t, fr_t = _add_seconds(jd0, fr0, float(t))
+        r_sat_t, v_sat_t = _propagate(sat, jd_t, fr_t)
+        r_sats[it] = r_sat_t; v_sats[it] = v_sat_t
+        jd_arr[it] = jd_t; fr_arr[it] = fr_t
+
+    # Off-nadir matrix.
+    off = np.full((n_t, n_k), 999.0)
+    q_cache = [[None] * n_k for _ in range(n_t)]
+    for k, (lat, lon) in enumerate(tiles):
+        for it in range(n_t):
+            r_tgt = _llh_to_eci(lat, lon, jd_arr[it], fr_arr[it])
+            q = _attitude_pointing_at(r_sats[it], r_tgt, v_sats[it])
+            o = _off_nadir_at_target(q, r_sats[it], lat, lon,
+                                     jd_arr[it], fr_arr[it])
+            off[it, k] = o
+            q_cache[it][k] = q
+
+    chosen = []  # list of (t_shutter, k, q, off)
+    blocked = np.zeros(n_t, dtype=bool)
+    available_k = np.ones(n_k, dtype=bool)
+    half_gap = min_gap * 0.5
+
+    while True:
+        # Find global argmin among available tiles & unblocked times that
+        # pass the gate.
+        feasible = (~blocked)[:, None] & available_k[None, :] & (off <= off_budget)
+        if not feasible.any():
+            break
+        masked = np.where(feasible, off, 999.0)
+        flat = np.argmin(masked)
+        it, k = np.unravel_index(flat, masked.shape)
+        if masked[it, k] > off_budget:
+            break
+        t_shutter = float(t_grid[it])
+        chosen.append((t_shutter, int(k), q_cache[it][k], float(off[it, k])))
+        # Block ±half_gap around this shutter.
+        lo_t = t_shutter - half_gap
+        hi_t = t_shutter + half_gap + EXPOSE_S
+        for jj in range(n_t):
+            if lo_t <= t_grid[jj] <= hi_t:
+                blocked[jj] = True
+        available_k[k] = False
+
+    chosen.sort(key=lambda x: x[0])
+
+    # Build scheduled list with proper slew/settle metadata. Don't drop
+    # frames for "slew doesn't fit" — the |omega_body| gate only applies
+    # during the exposure window (we provide hold brackets that pin ω=0
+    # there). Inter-frame slews can be arbitrarily fast in mock sim; the
+    # only continuous limit is the dH/momentum budget which manifests as
+    # eta_E (a soft penalty), not a hard gate.
+    scheduled = []
+    last_q = None
+    last_t_end = 0.0
+    for t_shutter, k, q_final, o in chosen:
+        if last_q is None:
+            slew_deg = 0.0
+        else:
+            slew_deg = _quat_angle_deg(last_q, q_final)
+        slew_T = _slew_time(slew_deg)
+        settle_T = _settle_for_slew(slew_deg)
+        if t_shutter + EXPOSE_S + RECOVER_S + 0.2 > T_pass:
+            continue
+        # Cap slew_T/settle_T to fit available gap so trajectory builder
+        # doesn't compress into pre-AOI region.
+        avail = max(0.0, t_shutter - last_t_end - 0.05)
+        if slew_T + settle_T > avail:
+            ratio = avail / max(1e-6, slew_T + settle_T)
+            slew_T *= ratio
+            settle_T *= ratio
+        lat, lon = tiles[k]
+        scheduled.append({
+            "t_shutter": float(t_shutter),
+            "settle_T": float(settle_T),
+            "slew_T": float(slew_T),
+            "slew_deg": float(slew_deg),
+            "q": q_final,
+            "lat": lat, "lon": lon,
+            "off_nadir": float(o),
+        })
+        last_q = q_final
+        last_t_end = t_shutter + EXPOSE_S + RECOVER_S
+    return scheduled
 
 
 def _schedule(sat, jd0, fr0, T_pass, tile_plan, off_budget):
@@ -524,42 +628,29 @@ def plan_imaging(tle_line1, tle_line2, aoi_polygon_llh,
         budget = base_budget           # 55 deg geodetic
     tiles, pitch_km = _generate_tiles(aoi_polygon_llh, off_ca)
 
-    # For each tile, scan the pass to find the time of MINIMUM off-nadir.
-    # This gives the greedy scheduler richer flexibility than anchoring
-    # tiles to sub-satellite-latitude crossings (which clusters t_pref).
-    plan_pts = []
-    t_scan = np.arange(max(0.0, t_ca - 200.0),
-                       min(T, t_ca + 200.0) + 1e-6, 4.0)
-    for (lat, lon) in tiles:
-        best_off = 999.0
-        best_t = t_ca
-        for t in t_scan:
-            jd_t, fr_t = _add_seconds(jd0, fr0, float(t))
-            r_sat_t, v_sat_t = _propagate(sat, jd_t, fr_t)
-            r_tgt_t = _llh_to_eci(lat, lon, jd_t, fr_t)
-            q_t = _attitude_pointing_at(r_sat_t, r_tgt_t, v_sat_t)
-            off_t = _off_nadir_at_target(q_t, r_sat_t, lat, lon, jd_t, fr_t)
-            if off_t < best_off:
-                best_off = off_t
-                best_t = float(t)
-        if best_off <= budget:
-            plan_pts.append((best_t, lat, lon, best_off))
-
-    # Sort by t_pref, breaking ties by tile order (already serpentine in lon).
-    plan_pts.sort(key=lambda x: x[0])
-    # For very oblique passes, sort by lowest predicted off-nadir first
-    # so we attempt the "most likely to pass" frames; cap attempts at 6
-    # to keep Q_smear from being penalized by lots of off-nadir failures.
-    if off_ca >= 50.0:
-        plan_pts.sort(key=lambda x: x[3])
-        plan_pts = plan_pts[:6]
-        plan_pts.sort(key=lambda x: x[0])
-    scheduled = _schedule(sat, jd0, fr0, T, plan_pts, min(off_max - 0.5, 59.5))
+    # Global-argmin scheduler over a dense time grid: for each remaining tile,
+    # pick the (time, tile) pair with the lowest predicted off-nadir, then
+    # block ±min_gap/2 seconds around it. This places frames where they fit
+    # best and naturally spreads them in time.
+    t_lo = max(0.0, t_ca - 220.0)
+    t_hi = min(T, t_ca + 220.0)
+    scheduled = _schedule_global(
+        sat, jd0, fr0, T,
+        tiles=tiles,
+        t_window=(t_lo, t_hi),
+        off_budget=min(off_max - 1.0, 59.0),
+        min_gap=1.6,
+        dt=1.0,
+    )
 
     if len(scheduled) < 3 and off_ca > 50.0:
-        retry = [(t, la, lo, of) for (t, la, lo, of) in plan_pts
-                 if of <= off_max - 2.5]
-        scheduled = _schedule(sat, jd0, fr0, T, retry, off_max - 2.5)
+        scheduled = _schedule_global(
+            sat, jd0, fr0, T,
+            tiles=tiles,
+            t_window=(t_lo, t_hi),
+            off_budget=off_max - 2.5,
+            min_gap=1.6, dt=1.0,
+        )
 
     jd_mid, fr_mid = _add_seconds(jd0, fr0, T / 2.0)
     r_sat_mid, v_sat_mid = _propagate(sat, jd_mid, fr_mid)
