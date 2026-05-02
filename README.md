@@ -5,16 +5,15 @@ attitude planning and imaging scheduling.
 
 ## Scoring (current)
 
-Against `app/data/test_cases.json` (web-app weights `1.00 / 0.50 / 0.25`):
+Against `app/data/test_cases.json` (contest weights `0.25 / 0.35 / 0.40`):
 
-| Case | Coverage | η_E   | η_T   | Q_smear | Score  | Tiles imaged |
-|------|----------|-------|-------|---------|--------|--------------|
-| 1    | 1.00     | 0.21  | 0.99  | 1.00    | 1.151  | 49 / 49      |
-| 2    | 1.00     | 0.48  | 0.99  | 1.00    | 1.219  | 36 / 36      |
-| 3    | 0.89     | 0.86  | 1.00  | 1.00    | 1.174  | 10 / 16      |
+| Case | Coverage | η_E   | η_T   | Q_smear | S_orbit | Weight | Tiles imaged |
+|------|----------|-------|-------|---------|---------|--------|--------------|
+| 1    | 1.00     | 0.21  | 0.99  | 1.00    | 1.151   | 0.25   | 49 / 49      |
+| 2    | 1.00     | 0.48  | 0.99  | 1.00    | 1.219   | 0.35   | 36 / 36      |
+| 3    | 0.89     | 0.86  | 1.00  | 1.00    | 1.174   | 0.40   | 10 / 16      |
 
-`S_total = 2.05` (web weights). `S_total = 1.18` under the original hackathon
-weights (`0.25 / 0.35 / 0.40`).
+`S_total = 0.25·1.151 + 0.35·1.219 + 0.40·1.174 = 1.18`.
 
 ## Planner architecture
 
