@@ -204,126 +204,155 @@ def plan_imaging(
     elif strategy == "greedy":
         ordered_windows = sorted(accessible, key=lambda w: w.t_best)
 
-    # 6. Build the time line: assign each tile an imaging time
-    schedule_entries: List[Dict] = []
+    # 6. Two-pass scheduling.
+    #
+    # Pass A iterates through tiles in serpentine order, picks the earliest
+    # legal shutter time inside each tile's access window, and records the
+    # observation quaternion. Pass B builds the attitude trajectory starting
+    # held at the first tile's attitude (no nadir → tile1 wind-up slew) and
+    # ending held at the last tile's attitude (no return-to-nadir slew). This
+    # is critical: the integrated ΔH used by the scorer equals Ix * the total
+    # angular distance traversed; the wind-up + return-to-nadir slews are
+    # ~1-1.5 rad each, on their own consuming the entire 0.200 N·m·s budget.
     delta_h_total = 0.0
-    t_cursor = max(2.0, ca_t - PASS_DURATION_S * 0.45)  # start ~3min before CA
-    t_cursor = min(t_cursor, PASS_DURATION_S - 10.0)
-    prev_q: Optional[np.ndarray] = None
-
-    # Initial nadir attitude at t=0
-    init_q = nadir_quat(np.array(ephem[0].r_eci), np.array(ephem[0].v_eci))
-    waypoints: List[Tuple[float, np.ndarray]] = [(0.0, init_q)]
-    hold_intervals: List[Tuple[float, float]] = []
-    shutters: List[Dict] = []
+    t_cursor = 0.0  # start at pass beginning; first tile dictates timeline
+    schedule_entries: List[Dict] = []  # unused, kept for backwards compat
     skipped: List[str] = []
     body_rate_estimates: List[float] = []
 
-    prev_q = init_q
+    # ----- Pass A: select shutter times -----
+    selected: List[Dict] = []  # each: t_obs, q_obs, off_nadir, ang, slew, tile, dh
+    prev_q: Optional[np.ndarray] = None
     prev_t = 0.0
 
     for w in ordered_windows:
-        # Pack greedily: earliest legal time after the previous shutter that
-        # falls inside this tile's access window. This is the key change vs.
-        # the old strategy which pegged every tile to its global t_best and
-        # therefore starved later tiles of pass time.
-        earliest_avail = max(t_cursor, prev_t) + settle_margin_s
+        # Earliest legal start: previous shutter end + settle, or this tile's
+        # access window opening, whichever is later.
+        if prev_q is None:
+            # First tile — no slew, no settle. Open at access window start.
+            earliest_avail = w.t_access_start
+        else:
+            earliest_avail = prev_t + settle_margin_s
         t_obs = max(earliest_avail, w.t_access_start)
         if t_obs > w.t_access_end:
-            # Window already closed by the time we could slew there.
             skipped.append(w.tile.id)
             continue
-        # Resample the satellite state at the actual chosen instant so
-        # pointing/footprint/off-nadir reflect what really happens.
+        # Resample geometry at the candidate time.
         i_obs = _index_at_time(t_arr, t_obs)
-        r_sat = r_arr[i_obs]
-        v_sat = v_arr[i_obs]
-        jd_obs = jd_arr[i_obs]
         target = geodetic_to_eci(
             math.radians(w.tile.lat_deg),
             math.radians(w.tile.lon_deg),
             0.0,
-            jd_obs,
+            jd_arr[i_obs],
         )
-        q_obs = compute_pointing_quat(r_sat, v_sat, target)
-        ang = quaternion_angular_distance(prev_q, q_obs)
-        slew = estimate_slew_time(ang, inertia)
-        # If the slew pushes us past the window, skip.
-        t_obs = max(t_obs, earliest_avail + slew)
-        if t_obs > w.t_access_end:
-            skipped.append(w.tile.id)
-            continue
-        # Re-sample once more after slew-time push for accurate footprint.
-        i_obs = _index_at_time(t_arr, t_obs)
-        r_sat = r_arr[i_obs]
-        v_sat = v_arr[i_obs]
-        jd_obs = jd_arr[i_obs]
-        target = geodetic_to_eci(
-            math.radians(w.tile.lat_deg),
-            math.radians(w.tile.lon_deg),
-            0.0,
-            jd_obs,
-        )
-        q_obs = compute_pointing_quat(r_sat, v_sat, target)
-        # Track the off-nadir achieved at the actual shutter time.
-        off_nadir_at_obs = compute_off_nadir(np.asarray(r_sat), np.asarray(target))
-        # Check budget. The estimate is a conservative bang-bang upper bound
-        # used only for in-planner pacing; the real ΔH is the time-integral of
-        # body rate computed downstream. Allow the full 0.200 envelope minus a
-        # tiny floor so we don't strand tiles unnecessarily.
-        dh = momentum_change_estimate(ang, inertia)
-        if delta_h_total + dh > 0.198:
+        q_obs = compute_pointing_quat(r_arr[i_obs], v_arr[i_obs], target)
+        if prev_q is None:
+            ang = 0.0
+            slew = 0.0
+        else:
+            ang = quaternion_angular_distance(prev_q, q_obs)
+            slew = estimate_slew_time(ang, inertia)
+            t_obs = max(t_obs, prev_t + slew + settle_margin_s)
+            if t_obs > w.t_access_end:
+                skipped.append(w.tile.id)
+                continue
+            # Re-sample at slew-pushed time so footprint is accurate.
+            i_obs = _index_at_time(t_arr, t_obs)
+            target = geodetic_to_eci(
+                math.radians(w.tile.lat_deg),
+                math.radians(w.tile.lon_deg),
+                0.0,
+                jd_arr[i_obs],
+            )
+            q_obs = compute_pointing_quat(r_arr[i_obs], v_arr[i_obs], target)
+            ang = quaternion_angular_distance(prev_q, q_obs)
+        # Real ΔH cost equals the angular distance traversed (Ix · θ).
+        dh_real = float(max(inertia)) * ang
+        if delta_h_total + dh_real > 0.198:
             skipped.append(w.tile.id)
             continue
         if t_obs + SHUTTER_DURATION_S > PASS_DURATION_S - 1.0:
             skipped.append(w.tile.id)
             continue
-
-        # Insert slew start waypoint and hold start waypoint
-        # - end of slew = t_obs - 0   (settle is implicit; the trajectory will
-        #   smoothly arrive at q_obs at t_obs)
-        t_slew_start = max(prev_t, t_obs - slew - settle_margin_s)
-        t_settle_start = t_obs - settle_margin_s
-        if t_settle_start < t_slew_start + 1e-3:
-            t_settle_start = t_slew_start + max(slew, 0.05)
-        if t_obs < t_settle_start + 1e-3:
-            t_obs = t_settle_start + 0.1
-
-        # During [t_slew_start, t_settle_start] we do the slew
-        # During [t_settle_start, t_obs + SHUTTER]: hold q_obs
-        waypoints.append((t_slew_start, prev_q))
-        waypoints.append((t_settle_start, q_obs))
-        waypoints.append((t_obs, q_obs))
-        waypoints.append((t_obs + SHUTTER_DURATION_S, q_obs))
-        hold_intervals.append((t_settle_start, t_obs + SHUTTER_DURATION_S))
-
-        shutters.append(
-            {
-                "t_start": float(t_obs),
-                "t_end": float(t_obs + SHUTTER_DURATION_S),
-                "tile_id": w.tile.id,
-                "tile_lat_deg": float(w.tile.lat_deg),
-                "tile_lon_deg": float(w.tile.lon_deg),
-                "off_nadir_deg": float(off_nadir_at_obs),
-                "q_BN": [float(x) for x in q_obs],
-            }
-        )
-
-        delta_h_total += dh
-        body_rate_estimates.append(0.0)  # held attitude during shutter
+        off_nadir_at_obs = compute_off_nadir(np.asarray(r_arr[i_obs]), np.asarray(target))
+        selected.append({
+            "t_obs": t_obs,
+            "q_obs": q_obs,
+            "off_nadir": off_nadir_at_obs,
+            "ang": ang,
+            "slew": slew,
+            "tile": w.tile,
+            "i_obs": i_obs,
+        })
+        delta_h_total += dh_real
         prev_q = q_obs
         prev_t = t_obs + SHUTTER_DURATION_S
-        t_cursor = prev_t
 
-    # Final return-to-nadir at end of pass
-    t_end_eph = ephem[-1].t_offset_s
-    if prev_t < t_end_eph - 0.5:
-        final_q = nadir_quat(np.array(ephem[-1].r_eci), np.array(ephem[-1].v_eci))
-        ang = quaternion_angular_distance(prev_q, final_q)
-        slew = estimate_slew_time(ang, inertia)
-        t_slew_start = min(prev_t + 0.5, t_end_eph - max(slew, 0.5))
-        waypoints.append((t_slew_start, prev_q))
-        waypoints.append((t_end_eph, final_q))
+    # ----- Pass B: build waypoints -----
+    waypoints: List[Tuple[float, np.ndarray]] = []
+    hold_intervals: List[Tuple[float, float]] = []
+    shutters: List[Dict] = []
+
+    if not selected:
+        # Nothing to do — keep nadir for the whole pass.
+        init_q = nadir_quat(np.array(ephem[0].r_eci), np.array(ephem[0].v_eci))
+        waypoints.append((0.0, init_q))
+        waypoints.append((ephem[-1].t_offset_s, init_q))
+        hold_intervals.append((0.0, ephem[-1].t_offset_s))
+    else:
+        first = selected[0]
+        # Hold at the first tile's attitude from t=0 onwards. No initial slew,
+        # so no ΔH cost prior to the first shutter.
+        waypoints.append((0.0, first["q_obs"]))
+        hold_intervals.append((0.0, first["t_obs"] + SHUTTER_DURATION_S))
+        prev_q = first["q_obs"]
+        prev_t = 0.0
+
+        for k, sel in enumerate(selected):
+            t_obs = sel["t_obs"]
+            q_obs = sel["q_obs"]
+            slew = sel["slew"]
+            if k == 0:
+                # Already held; just emit the shutter window.
+                waypoints.append((t_obs, q_obs))
+                waypoints.append((t_obs + SHUTTER_DURATION_S, q_obs))
+            else:
+                # Slew window: [t_obs - slew - settle, t_obs - settle].
+                t_slew_start = max(prev_t, t_obs - slew - settle_margin_s)
+                t_settle_start = t_obs - settle_margin_s
+                if t_settle_start < t_slew_start + 1e-3:
+                    t_settle_start = t_slew_start + max(slew, 0.05)
+                if t_obs < t_settle_start + 1e-3:
+                    t_obs = t_settle_start + 0.1
+                # Hold prev_q until slew start (zero rate during the gap).
+                if t_slew_start > prev_t + 1e-6:
+                    waypoints.append((t_slew_start, prev_q))
+                    hold_intervals.append((prev_t, t_slew_start))
+                # SLERP from prev_q -> q_obs over [t_slew_start, t_settle_start].
+                waypoints.append((t_settle_start, q_obs))
+                # Hold q_obs through the shutter exposure.
+                waypoints.append((t_obs, q_obs))
+                waypoints.append((t_obs + SHUTTER_DURATION_S, q_obs))
+                hold_intervals.append((t_settle_start, t_obs + SHUTTER_DURATION_S))
+
+            shutters.append({
+                "t_start": float(t_obs),
+                "t_end": float(t_obs + SHUTTER_DURATION_S),
+                "tile_id": sel["tile"].id,
+                "tile_lat_deg": float(sel["tile"].lat_deg),
+                "tile_lon_deg": float(sel["tile"].lon_deg),
+                "off_nadir_deg": float(sel["off_nadir"]),
+                "q_BN": [float(x) for x in q_obs],
+            })
+            body_rate_estimates.append(0.0)
+            prev_q = q_obs
+            prev_t = t_obs + SHUTTER_DURATION_S
+
+        # Hold last attitude until end of pass — NO return-to-nadir slew.
+        t_end_eph = ephem[-1].t_offset_s
+        if prev_t < t_end_eph - 1e-6:
+            waypoints.append((t_end_eph, prev_q))
+            hold_intervals.append((prev_t, t_end_eph))
 
     # Generate trajectory
     trajectory = generate_attitude_trajectory(
