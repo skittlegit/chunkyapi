@@ -18,7 +18,7 @@ class PlanRequest(BaseModel):
     pass_end_utc: Optional[str] = None
     sc_params: Optional[dict] = None
     strategy: str = "boustrophedon"
-    settle_margin_s: float = 3.0
+    settle_margin_s: float = 0.3
     off_nadir_margin_deg: float = 5.0
 
 

@@ -69,18 +69,26 @@ def simulate(req: SimulateRequest) -> SimulateResponse:
     attitude = schedule.get("attitude", [])
     shutters = schedule.get("shutters", [])
 
+    # Sample body rate at multiple points within each shutter exposure so a
+    # single mis-aligned waypoint cannot dominate Q_smear. We measure the rate
+    # over the full shutter interval as the worst-case proxy for image smear.
     body_rates: List[float] = []
     for sh in shutters:
-        t_mid = 0.5 * (float(sh["t_start"]) + float(sh["t_end"]))
-        eps = 0.01
-        q_a = _sample_attitude_at(attitude, t_mid - eps)
-        q_b = _sample_attitude_at(attitude, t_mid + eps)
-        body_rates.append(estimate_body_rate(q_a, q_b, 2 * eps))
+        t0_sh = float(sh["t_start"])
+        t1_sh = float(sh["t_end"])
+        n_samples = 5
+        for k in range(n_samples):
+            u0 = k / n_samples
+            u1 = (k + 1) / n_samples
+            ta = t0_sh + u0 * (t1_sh - t0_sh)
+            tb = t0_sh + u1 * (t1_sh - t0_sh)
+            q_a = _sample_attitude_at(attitude, ta)
+            q_b = _sample_attitude_at(attitude, tb)
+            body_rates.append(estimate_body_rate(q_a, q_b, max(tb - ta, 1e-6)))
 
-    if shutters:
-        t_active = float(shutters[-1]["t_end"]) - float(attitude[0]["t"])
-    else:
-        t_active = 0.0
+    # Time efficiency uses the active integration time (sum of shutter
+    # durations), not the whole imaging window. Matches the hackathon scorer.
+    t_active = sum(float(sh["t_end"]) - float(sh["t_start"]) for sh in shutters)
 
     inertia = schedule.get("meta", {}).get("inertia") or DEFAULT_INERTIA
     Ix = float(inertia[0])

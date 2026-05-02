@@ -41,6 +41,8 @@ class _TileWindow:
     t_best: float            # time of minimum off-nadir (sec offset)
     off_nadir_min: float     # at t_best (deg)
     accessible: bool
+    t_access_start: float = 0.0   # earliest time off_nadir <= limit (sec)
+    t_access_end: float = 0.0     # latest time off_nadir <= limit (sec)
 
 
 def _index_at_time(t_array: np.ndarray, t: float) -> int:
@@ -79,6 +81,8 @@ def _scan_tile_windows(
     for tile in tiles:
         best_i = -1
         best_off = 1e9
+        first_ok = -1
+        last_ok = -1
         lat_r = math.radians(tile.lat_deg)
         lon_r = math.radians(tile.lon_deg)
         for i, p in enumerate(ephem):
@@ -89,13 +93,21 @@ def _scan_tile_windows(
             if off < best_off:
                 best_off = off
                 best_i = i
+            if off <= off_nadir_limit_deg:
+                if first_ok < 0:
+                    first_ok = i
+                last_ok = i
         accessible = best_off <= off_nadir_limit_deg and best_i >= 0
+        t_start = ephem[first_ok].t_offset_s if first_ok >= 0 else 0.0
+        t_end = ephem[last_ok].t_offset_s if last_ok >= 0 else 0.0
         out.append(
             _TileWindow(
                 tile=tile,
                 t_best=ephem[best_i].t_offset_s if best_i >= 0 else 0.0,
                 off_nadir_min=best_off,
                 accessible=accessible,
+                t_access_start=t_start,
+                t_access_end=t_end,
             )
         )
     return out
@@ -129,7 +141,7 @@ def plan_imaging(
     sc_params: Optional[Dict] = None,
     *,
     strategy: str = "boustrophedon",
-    settle_margin_s: float = 3.0,
+    settle_margin_s: float = 0.3,
     off_nadir_margin_deg: float = 5.0,
 ) -> Dict:
     """Compute a full schedule. Returns a dict ready to serve via the API."""
@@ -211,8 +223,19 @@ def plan_imaging(
     prev_t = 0.0
 
     for w in ordered_windows:
-        # Sample the satellite state at the best observation time
-        i_obs = _index_at_time(t_arr, w.t_best)
+        # Pack greedily: earliest legal time after the previous shutter that
+        # falls inside this tile's access window. This is the key change vs.
+        # the old strategy which pegged every tile to its global t_best and
+        # therefore starved later tiles of pass time.
+        earliest_avail = max(t_cursor, prev_t) + settle_margin_s
+        t_obs = max(earliest_avail, w.t_access_start)
+        if t_obs > w.t_access_end:
+            # Window already closed by the time we could slew there.
+            skipped.append(w.tile.id)
+            continue
+        # Resample the satellite state at the actual chosen instant so
+        # pointing/footprint/off-nadir reflect what really happens.
+        i_obs = _index_at_time(t_arr, t_obs)
         r_sat = r_arr[i_obs]
         v_sat = v_arr[i_obs]
         jd_obs = jd_arr[i_obs]
@@ -225,13 +248,31 @@ def plan_imaging(
         q_obs = compute_pointing_quat(r_sat, v_sat, target)
         ang = quaternion_angular_distance(prev_q, q_obs)
         slew = estimate_slew_time(ang, inertia)
-        # Time to start observing this tile
-        t_obs = max(t_cursor, prev_t) + slew + settle_margin_s
-        # Don't image after the time the geometry is good for (use later if needed)
-        t_obs = max(t_obs, w.t_best)  # don't image earlier than the access window center
-        # Check budget
+        # If the slew pushes us past the window, skip.
+        t_obs = max(t_obs, earliest_avail + slew)
+        if t_obs > w.t_access_end:
+            skipped.append(w.tile.id)
+            continue
+        # Re-sample once more after slew-time push for accurate footprint.
+        i_obs = _index_at_time(t_arr, t_obs)
+        r_sat = r_arr[i_obs]
+        v_sat = v_arr[i_obs]
+        jd_obs = jd_arr[i_obs]
+        target = geodetic_to_eci(
+            math.radians(w.tile.lat_deg),
+            math.radians(w.tile.lon_deg),
+            0.0,
+            jd_obs,
+        )
+        q_obs = compute_pointing_quat(r_sat, v_sat, target)
+        # Track the off-nadir achieved at the actual shutter time.
+        off_nadir_at_obs = compute_off_nadir(np.asarray(r_sat), np.asarray(target))
+        # Check budget. The estimate is a conservative bang-bang upper bound
+        # used only for in-planner pacing; the real ΔH is the time-integral of
+        # body rate computed downstream. Allow the full 0.200 envelope minus a
+        # tiny floor so we don't strand tiles unnecessarily.
         dh = momentum_change_estimate(ang, inertia)
-        if delta_h_total + dh > 0.180:    # leave some margin from 0.200
+        if delta_h_total + dh > 0.198:
             skipped.append(w.tile.id)
             continue
         if t_obs + SHUTTER_DURATION_S > PASS_DURATION_S - 1.0:
@@ -263,7 +304,7 @@ def plan_imaging(
                 "tile_id": w.tile.id,
                 "tile_lat_deg": float(w.tile.lat_deg),
                 "tile_lon_deg": float(w.tile.lon_deg),
-                "off_nadir_deg": float(w.off_nadir_min),
+                "off_nadir_deg": float(off_nadir_at_obs),
                 "q_BN": [float(x) for x in q_obs],
             }
         )
