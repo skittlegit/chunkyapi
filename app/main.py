@@ -13,7 +13,6 @@ from .routes import planning as planning_routes
 from .routes import simulation as simulation_routes
 from .routes import validation as validation_routes
 
-
 logging.basicConfig(level=settings.log_level.upper())
 
 app = FastAPI(title="ChunkyAPI", version=settings.version)

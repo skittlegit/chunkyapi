@@ -10,6 +10,7 @@ import numpy as np
 from ..config import (
     DEFAULT_FOV_DEG,
     DEFAULT_INERTIA,
+    OFF_NADIR_HARD_LIMIT_DEG,
     OFF_NADIR_SAFE_LIMIT_DEG,
     PASS_DURATION_S,
     SHUTTER_DURATION_S,
@@ -135,7 +136,8 @@ def plan_imaging(
     sc_params = sc_params or {}
     fov_deg = float(sc_params.get("fov_deg", DEFAULT_FOV_DEG))
     inertia = tuple(sc_params.get("inertia", DEFAULT_INERTIA))
-    off_nadir_limit = OFF_NADIR_SAFE_LIMIT_DEG - off_nadir_margin_deg
+    strict_limit = OFF_NADIR_SAFE_LIMIT_DEG - off_nadir_margin_deg
+    hard_ceiling = OFF_NADIR_HARD_LIMIT_DEG - 1.0  # never image at the gate itself
 
     # 1. Propagate
     ephem = propagate_pass(tle_line1, tle_line2, pass_start_utc, pass_end_utc, dt=1.0)
@@ -153,9 +155,26 @@ def plan_imaging(
     tile_size_km = max(8.0, adaptive_tile_size_km(max(ca_off, 1.0), fov_deg, alt_km))
     tiles = tile_aoi(aoi_polygon, tile_size_km)
 
-    # 4. Tile windows
-    windows = _scan_tile_windows(ephem, tiles, off_nadir_limit)
-    accessible = [w for w in windows if w.accessible]
+    # 4. Tile windows -- adaptive threshold ladder. Start strict; if no tile is
+    # accessible (typical for far ground tracks like case 3), progressively
+    # loosen toward the hard 60 deg gate, capped 1 deg below it.
+    candidate_limits: List[float] = [strict_limit]
+    for extra in (5.0, 7.0, 9.0, 11.0):
+        cand = strict_limit + extra
+        if cand <= hard_ceiling and cand not in candidate_limits:
+            candidate_limits.append(cand)
+    if hard_ceiling not in candidate_limits:
+        candidate_limits.append(hard_ceiling)
+
+    windows: List[_TileWindow] = []
+    accessible: List[_TileWindow] = []
+    off_nadir_limit = strict_limit
+    for limit in candidate_limits:
+        windows = _scan_tile_windows(ephem, tiles, limit)
+        accessible = [w for w in windows if w.accessible]
+        off_nadir_limit = limit
+        if accessible:
+            break
 
     # 5. Order tiles (boustrophedon by default)
     ordered_windows = sorted(accessible, key=lambda w: (w.tile.lat_deg, w.tile.lon_deg))
@@ -308,6 +327,7 @@ def plan_imaging(
         "closest_approach_s": float(ca_t),
         "closest_approach_off_nadir_deg": float(ca_off),
         "tile_size_km": float(tile_size_km),
+        "off_nadir_limit_deg": float(off_nadir_limit),
     }
     return {
         "schedule": schedule,

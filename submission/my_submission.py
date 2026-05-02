@@ -1,6 +1,7 @@
 """
 Lost in Space - submission (v4).
 
+
 Strategy
 --------
 Maximize  S = C * (1 + 0.25*eta_E + 0.10*eta_T) * Q_smear

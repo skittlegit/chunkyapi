@@ -9,7 +9,6 @@ from typing import List
 def _parse_origins(value: str) -> List[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
 
-
 @dataclass
 class Settings:
     version: str = "0.1.0"
