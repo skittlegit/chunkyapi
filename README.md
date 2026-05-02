@@ -1,7 +1,8 @@
 # ChunkyAPI
 
 FastAPI backend for the "Lost in Space" hackathon — satellite Earth observation
-attitude planning and imaging scheduling.
+attitude planning and imaging scheduling. Pairs with the
+[chunkyweb](https://github.com/skittlegit/chunkyweb) front-end console.
 
 ## Scoring (current)
 
