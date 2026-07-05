@@ -64,10 +64,14 @@ API docs at http://localhost:8000/docs
 - `POST /api/simulate`
 - `POST /api/validate`
 
-## Deploy (Railway)
+## Deploy (Render)
 
-The repo includes `Dockerfile` and `railway.toml`. Set `ALLOWED_ORIGINS` env
-var in the Railway dashboard if your frontend lives on a non-default origin.
+The repo includes `Dockerfile` and `render.yaml` (a Render Blueprint). In the
+Render dashboard, create a new **Blueprint** from this repo — Render reads
+`render.yaml`, builds the Docker image, and exposes the service on the `PORT`
+it injects (the app already reads `PORT` from the environment). The `/health`
+endpoint is wired up as the health check. Override `ALLOWED_ORIGINS` in the
+Render dashboard if your frontend lives on a non-default origin.
 
 ## Tests
 

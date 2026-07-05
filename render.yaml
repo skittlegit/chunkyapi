@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: chunkyapi
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: https://chunkyweb.vercel.app,http://localhost:3000
+      - key: LOG_LEVEL
+        value: info
